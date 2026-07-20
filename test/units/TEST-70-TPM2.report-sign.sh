@@ -3,21 +3,27 @@
 set -eux
 set -o pipefail
 
-# Test report signing through the TPM2 backend (systemd-report-sign-tpm2), driven
-# via the io.systemd.Report Varlink interface (the GenerateSigned method). This is
+# Test report signing through the TPM2 backend (systemd-report-sign-tpm2). This is
 # the TPM2 counterpart to the plain software backend test in
 # TEST-74-AUX-UTILS.report.sh; it lives here because it needs a real TPM, which
 # only the TPM2 integration test provides.
 #
-# The TPM2 backend returns a set of signed TPM attestations (a PCR quote, one
-# NV certification per NvPCR, and a session audit digest), together with the
-# signing key's public area and the pcrlock event log. The public area, the
-# attestations and the signatures are all serialized as TCG TSS2 JSON. For each
-# attestation we rebuild the public key, re-marshal the TPMS_ATTEST that was
-# signed, and verify the signature using the embedded Python helper below. The
-# helper also cross-checks the parallel PEM encodings (publicKeyPEM and signaturePEM)
-# against the JSON encodings. We also confirm the report digest is carried in the
-# extraData field of the session audit attestation.
+# It exercises two Varlink interfaces:
+#
+#  - io.systemd.Report.TPM2SignerKeyManager for managing signing keys.
+#
+#  - io.systemd.Report (GenerateSigned) to produce a signed report via
+#    systemd-report. The TPM2 backend signs it with every configured key, returning
+#    one signature record for each. Each record carries a set of signed TPM
+#    attestations (a PCR quote, one NV certification per NvPCR, and a session audit
+#    digest), together with the signing key's public area and the pcrlock event log,
+#    all serialized as TCG TSS2 JSON. For each attestation we rebuild the public key,
+#    re-marshal the TPMS_ATTEST that was signed, and verify the signature using
+#    the embedded Python helper below. The helper also cross-checks the parallel
+#    PEM encodings (publicKeyPEM and signaturePEM) against the JSON encodings, and
+#    confirms the report digest is carried in the extraData field of the session
+#    audit attestation. We also confirm each report was signed by the key we
+#    created for it.
 #
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
@@ -30,6 +36,13 @@ export PAGER=
 # skip if the socket isn't present.
 if ! systemctl cat systemd-report-sign-tpm2.socket &>/dev/null; then
     echo "systemd-report-sign-tpm2.socket is not installed, skipping TPM2 report signing test."
+    exit 0
+fi
+
+# The key manager Varlink interface (io.systemd.Report.TPM2SignerKeyManager) is
+# exposed on a separate socket. Skip if that's not installed.
+if ! systemctl cat systemd-report-sign-tpm2-key-manager.socket &>/dev/null; then
+    echo "systemd-report-sign-tpm2-key-manager.socket is not installed, skipping TPM2 report signing test."
     exit 0
 fi
 
@@ -48,9 +61,24 @@ fi
 
 WORK="$(mktemp -d)"
 
+# The key manager socket. Report signing itself is driven through systemd-report's
+# io.systemd.Report.GenerateSigned method.
+KEY_MANAGER="/run/systemd/io.systemd.Report.TPM2SignerKeyManager"
+
+# Where the backend keeps its keys and its cached key contexts.
+KEY_DIR="/var/lib/systemd/report.sign.tpm2"
+CONTEXT_DIR="/run/systemd/report.sign.tpm2"
+
+# A persistent handle used by the "persistent" key test.
+PERSISTENT_HANDLE="0x81020001"
+
+EK_HANDLE="0x81010001"
+
 at_exit() {
     set +e
-    systemctl stop systemd-report.socket systemd-report-sign-tpm2.socket
+    # Evict any persistent object the persistent-key test may have left behind.
+    tpm2_evictcontrol -C o -c "$PERSISTENT_HANDLE" >/dev/null 2>&1
+    systemctl stop systemd-report.socket systemd-report-sign-tpm2.socket systemd-report-sign-tpm2-key-manager.socket
     rm -rf "$WORK"
 }
 trap at_exit EXIT
@@ -59,7 +87,7 @@ trap at_exit EXIT
 # key. In a QEMU/swtpm guest there is no EK certificate, and the backend only
 # provisions an EK when a matching certificate is present. Create and persist
 # an EK directly. This fails if one already is already present, so ignore that.
-if ! tpm2_createek -c 0x81010001 -G ecc; then
+if ! tpm2_createek -c "$EK_HANDLE" -G ecc; then
     echo "tpm2_createek failed, assuming an EK is already present."
 fi
 
@@ -69,39 +97,13 @@ systemctl start systemd-pcrlock.socket
 
 systemctl start systemd-report.socket
 systemctl start systemd-report-sign-tpm2.socket
-
-# Ask systemd-report to generate a *signed* report over Varlink. The reply
-# carries the signed report as base64-encoded JSON-SEQ data.
-varlinkctl call /run/systemd/io.systemd.Report io.systemd.Report.GenerateSigned \
-    '{"matches":["io.systemd.Manager.UnitsTotal"]}' | jq -r .reportData | base64 -d >"$WORK/report.seq"
-
-# The first JSON-SEQ record is the report itself. This is exactly the byte
-# sequence that got signed, including the leading record separator (0x1e) and
-# the trailing newline, so 'head -n1' reproduces it verbatim.
-head -n1 "$WORK/report.seq" >"$WORK/message.bin"
-tr -d '\036' <"$WORK/message.bin" | jq -e '.mediaType == "application/vnd.io.systemd.report"' >/dev/null
-
-# The remaining record(s) are signature objects, one per enabled backend. Pick
-# out the one produced by the TPM2 backend (the plain backend may be enabled too).
-sig_json=""
-while IFS= read -r line; do
-    rec="$(echo "$line" | tr -d '\036')"
-    [[ -n "$rec" ]] || continue
-    if [[ "$(echo "$rec" | jq -r '.mechanism // empty')" == "tpm2" ]]; then
-        sig_json="$rec"
-    fi
-done < <(tail -n +2 "$WORK/report.seq")
-test -n "$sig_json"
-
-[ "$(echo "$sig_json" | jq -r .mediaType)" = "application/vnd.io.systemd.report.signature" ]
-
-# The sha256 recorded in the signature must match the digest of the report bytes.
-report_digest="$(sha256sum "$WORK/message.bin" | cut -d' ' -f1)"
-[ "$(echo "$sig_json" | jq -r .sha256)" = "$report_digest" ]
+systemctl start systemd-report-sign-tpm2-key-manager.socket
 
 # Use a python script for verifying the report component signatures because we
 # need to reconstruct the TPM2B_ATTEST bytes from the provided TPMS_ATTEST JSON
 # encoding, and construct a public key from the provided TPMT_PUBLIC JSON encoding.
+# It has two modes: "verify" checks a full report, and "pubkey-crosscheck"
+# crosschecks a JSON encoded TPMT_PUBLIC area with a PEM public key.
 VERIFY="$WORK/verify-report-sig.py"
 cat >"$VERIFY" <<'EOF'
 #!/usr/bin/env python3
@@ -405,10 +407,24 @@ def check_session_audit(doc, key_name):
 
 
 def main():
-    report_digest = sys.argv[1]
+    mode = sys.argv[1]
 
-    full = json.load(sys.stdin)
-    data = full["data"]
+    if mode == "pubkey-crosscheck":
+        # Check that the JSON TPMT_PUBLIC public area and the PEM public key read
+        # from stdin (as {"public": <obj>, "pem": <str>}) describe the same key.
+        obj = json.load(sys.stdin)
+        key = build_pubkey(obj["public"])
+        key_pem = serialization.load_pem_public_key(obj["pem"].encode())
+        if key.public_numbers() != key_pem.public_numbers():
+            sys.exit("publicPEM does not match public")
+        return
+
+    if mode != "verify":
+        sys.exit(f"unknown mode {mode!r}")
+
+    report_digest = sys.argv[2]
+
+    data = json.load(sys.stdin)
 
     # Rebuild the key from the JSON public area.
     key_json = build_pubkey(data["publicKey"])
@@ -469,9 +485,6 @@ if __name__ == "__main__":
     main()
 EOF
 
-n_components="$(echo "$sig_json" | jq '.data.components | length')"
-[ "$n_components" -gt 0 ]
-
 # The backend attests every defined NvPCR. Fetch them via systemd-analyze so we
 # know how many components to expect and can cross-check each one's name, index
 # and priority below. Columns: name, nvindex (an unsigned integer), priority.
@@ -479,54 +492,307 @@ nvpcrs_json="$(systemd-analyze nvpcrs --json=short)"
 expected_nvpcrs="$(echo "$nvpcrs_json" | jq 'length')"
 [ "$expected_nvpcrs" -gt 0 ]
 
-# Verify every component signature and collect the component types.
-echo "$sig_json" | python3 "$VERIFY" "$report_digest" >"$WORK/component-types"
-mapfile -t comp_types <"$WORK/component-types"
-[ "${#comp_types[@]}" -eq "$n_components" ]
+# Remove all keys, cached key contexts and created persistent objects, so each
+# test starts fresh.
+reset_state() {
+    tpm2_evictcontrol -C o -c "$PERSISTENT_HANDLE" >/dev/null 2>&1 || true
+    rm -f "$KEY_DIR"/* "$CONTEXT_DIR"/* 2>/dev/null || true
+}
 
-saw_pcr=0
-saw_audit=0
-n_nvpcr=0
+# Create a signing key via the key manager.
+#
+# $1: name.
+# $2: JSON parameters (the name is injected).
+#
+# Prints the reply.
+create_key() {
+    local name="$1" params="$2"
+    varlinkctl call "$KEY_MANAGER" io.systemd.Report.TPM2SignerKeyManager.CreateKey \
+        "$(jq -nc --arg name "$name" --argjson p "$params" '$p + {name: $name}')"
+}
 
-for i in "${!comp_types[@]}"; do
-    type="${comp_types[$i]}"
-    comp="$(echo "$sig_json" | jq -c ".data.components[$i]")"
+# Check that a CreateKey reply has the expected parameters.
+#
+# $1: the reply JSON.
+# $2: type (RSA|ECC).
+# $3: digest algorithm (SHA256|SHA384|SHA512).
+# $4: scheme (RSASSA|RSAPSS|ECDSA).
+# $5: RSA key size in bits, or ECC curve ID (NIST_P256|NIST_P384).
+check_reply() {
+    local reply="$1" kind="$2" name_alg="$3" scheme="$4" param="$5" pub
 
-    case "$type" in
-        pcr)
-            saw_pcr=1
-            ;;
-        nvpcr)
-            n_nvpcr=$((n_nvpcr + 1))
+    pub="$(jq -c .public <<<"$reply")"
 
-            # NvPCR components carry the readable name, the serialized NV public
-            # area, and the authenticated data digested into the attestation's
-            # qualifying data. Ensure they're populated.
-            name="$(echo "$comp" | jq -r '.["nvpcrName"] // empty')"
-            [ -n "$name" ]
-            [ -n "$(echo "$comp" | jq -r '.["nvPublic"] // empty')" ]
-            [ -n "$(echo "$comp" | jq -r '.["authenticatedData"] // empty')" ]
+    jq -e --arg t "$kind"     '.type == $t'                              <<<"$pub" >/dev/null
+    jq -e --arg n "$name_alg" '.nameAlg == $n'                           <<<"$pub" >/dev/null
+    jq -e --arg s "$scheme"   '.parameters.scheme.scheme == $s'          <<<"$pub" >/dev/null
+    jq -e --arg h "$name_alg" '.parameters.scheme.details.hashAlg == $h' <<<"$pub" >/dev/null
 
-            # The name must be one systemd-analyze knows about.
-            expected_nvpcr="$(echo "$nvpcrs_json" | jq -c --arg n "$name" '.[] | select(.name == $n)')"
-            [ -n "$expected_nvpcr" ]
+    # FIXEDTPM|FIXEDPARENT|SENSITIVEDATAORIGIN|USERWITHAUTH|ADMINWITHPOLICY|RESTRICTED|SIGN_ENCRYPT
+    jq -e '.objectAttributes == 327922' <<<"$pub" >/dev/null
 
-            # The certified NV index must match the one systemd-analyze reports.
-            [ "$(echo "$comp" | jq -r '.nvPublic.nvIndex')" = "$(echo "$expected_nvpcr" | jq -r '.nvindex')" ]
+    if [ "$kind" = "RSA" ]; then
+        jq -e --argjson kb "$param" '.parameters.keyBits == $kb' <<<"$pub" >/dev/null
+    else
+        jq -e --arg c "$param" '.parameters.curveID == $c' <<<"$pub" >/dev/null
+    fi
 
-            # authenticatedData is a JSON string carrying the NvPCR name and
-            # priority; both must match this component and systemd-analyze.
-            auth="$(echo "$comp" | jq -r '.authenticatedData')"
-            [ "$(echo "$auth" | jq -r '.name')" = "$name" ]
-            [ "$(echo "$auth" | jq -r '.priority')" = "$(echo "$expected_nvpcr" | jq -r '.priority')" ]
-            ;;
-        session-audit)
-            saw_audit=1
-            ;;
-    esac
-done
+    # public and publicPEM must be PEM/JSON encodings of the same key.
+    jq -c '{public: .public, pem: .publicPEM}' <<<"$reply" | python3 "$VERIFY" pubkey-crosscheck
+}
 
-# Make sure we saw the expected components.
-[ "$saw_pcr" -eq 1 ]
-[ "$saw_audit" -eq 1 ]
-[ "$n_nvpcr" -eq "$expected_nvpcrs" ]
+# Ask systemd-report to generate a *signed* report over Varlink. Each TPM2
+# signature record is written to $WORK/report.sig.N, one per configured signing
+# key. Prints the sha256 of the exact report bytes that were signed.
+generate_signed() {
+    rm -f "$WORK"/report.sig.*
+
+    # The reply carries the signed report as base64-encoded JSON-SEQ data.
+    varlinkctl call /run/systemd/io.systemd.Report io.systemd.Report.GenerateSigned \
+        '{"matches":["io.systemd.Manager.UnitsTotal"]}' | jq -r .reportData | base64 -d >"$WORK/report.seq"
+
+    # The first JSON-SEQ record is the report itself. This is exactly the byte
+    # sequence that got signed, including the leading record separator (0x1e) and
+    # the trailing newline, so 'head -n1' reproduces it verbatim.
+    head -n1 "$WORK/report.seq" >"$WORK/message.bin"
+    tr -d '\036' <"$WORK/message.bin" | jq -e '.mediaType == "application/vnd.io.systemd.report"' >/dev/null
+
+    # The remaining record(s) are signature objects, one per signature returned by
+    # an enabled backend. Write out the ones produced by the TPM2 backend, one
+    # per configured signing key.
+    local line rec n=0
+    while IFS= read -r line; do
+        rec="$(echo "$line" | tr -d '\036')"
+        [[ -n "$rec" ]] || continue
+        if [[ "$(jq -r '.mechanism // empty' <<<"$rec")" == "tpm2" ]]; then
+            echo "$rec" >"$WORK/report.sig.$n"
+            n=$((n + 1))
+        fi
+    done < <(tail -n +2 "$WORK/report.seq")
+
+    sha256sum "$WORK/message.bin" | cut -d' ' -f1
+}
+
+# Verify a single TPM2 signature record read from file $1.
+#
+# $1: signature record file.
+# $2: report digest.
+#
+# Prints the JSON public key that produced it.
+verify_tpm2_sig() {
+    local sig_file="$1" digest="$2" report
+
+    [ "$(jq -r .mediaType "$sig_file")" = "application/vnd.io.systemd.report.signature" ]
+    [ "$(jq -r .sha256 "$sig_file")" = "$digest" ]
+
+    report="$(jq -c .data "$sig_file")"
+
+    local n_components comp_types
+    n_components="$(jq '.components | length' <<<"$report")"
+    [ "$n_components" -gt 0 ]
+
+    # Verify every component signature and collect the component types.
+    python3 "$VERIFY" verify "$digest" <<<"$report" >"$WORK/component-types"
+    mapfile -t comp_types <"$WORK/component-types"
+    [ "${#comp_types[@]}" -eq "$n_components" ]
+
+    local saw_pcr=0 saw_audit=0 n_nvpcr=0 i type comp name auth expected_nvpcr
+    for i in "${!comp_types[@]}"; do
+        type="${comp_types[$i]}"
+        comp="$(jq -c ".components[$i]" <<<"$report")"
+
+        case "$type" in
+            pcr)
+                saw_pcr=1
+                ;;
+            nvpcr)
+                n_nvpcr=$((n_nvpcr + 1))
+
+                # NvPCR components carry the readable name, the serialized NV
+                # public area, and the authenticated data digested into the
+                # attestation's qualifying data. Ensure they're populated.
+                name="$(jq -r '.["nvpcrName"] // empty' <<<"$comp")"
+                [ -n "$name" ]
+                [ -n "$(jq -r '.["nvPublic"] // empty' <<<"$comp")" ]
+                [ -n "$(jq -r '.["authenticatedData"] // empty' <<<"$comp")" ]
+
+                # The name must be one systemd-analyze knows about.
+                expected_nvpcr="$(jq -c --arg n "$name" '.[] | select(.name == $n)' <<<"$nvpcrs_json")"
+                [ -n "$expected_nvpcr" ]
+
+                # The certified NV index must match the one systemd-analyze reports.
+                [ "$(jq -r '.nvPublic.nvIndex' <<<"$comp")" = "$(jq -r '.nvindex' <<<"$expected_nvpcr")" ]
+
+                # authenticatedData is a JSON string carrying the NvPCR name and
+                # priority; both must match this component and systemd-analyze.
+                auth="$(jq -r '.authenticatedData' <<<"$comp")"
+                [ "$(jq -r '.name' <<<"$auth")" = "$name" ]
+                [ "$(jq -r '.priority' <<<"$auth")" = "$(jq -r '.priority' <<<"$expected_nvpcr")" ]
+                ;;
+            session-audit)
+                saw_audit=1
+                ;;
+        esac
+    done
+
+    # Make sure we saw the expected components.
+    [ "$saw_pcr" -eq 1 ]
+    [ "$saw_audit" -eq 1 ]
+    [ "$n_nvpcr" -eq "$expected_nvpcrs" ]
+
+    jq -Sc '.publicKey' <<<"$report"
+}
+
+# Create a single key, check the reply, then generate a signed report and verify
+# the signature produced with it.
+#
+# $1: signing key name.
+# $2: signing key JSON parameters (the name is injected).
+# $3: expected type (RSA|ECC).
+# $4: expected digest algorithm (SHA256|SHA384|SHA512).
+# $5: expected scheme (RSASSA|RSAPSS|ECDSA).
+# $6: expected RSA key size in bits, or ECC curve ID (NIST_P256|NIST_P384).
+test_single_key() {
+    local name="$1" params="$2" kind="$3" name_alg="$4" scheme="$5" param="$6"
+
+    # Make sure the TPM supports the requested parameters.
+    local tp_type
+    if [ "$kind" = "RSA" ]; then
+        tp_type="rsa$param"
+    else
+        tp_type="ecc_${param,,}"
+    fi
+    if ! tpm2_supports_params "$tp_type" "${scheme,,}-${name_alg,,}"; then
+        echo "TPM does not support ${tp_type}:${scheme,,}-${name_alg,,}, skipping test '$name'."
+        return 0
+    fi
+
+    local reply
+    reset_state
+    reply="$(create_key "$name" "$params")"
+    check_reply "$reply" "$kind" "$name_alg" "$scheme" "$param"
+
+    # Check the key was stored under the requested name.
+    test -e "$KEY_DIR/$name.key"
+
+    local created_pub digest signed_pub
+    local -a sig_files
+    created_pub="$(jq -Sc .public <<<"$reply")"
+
+    digest="$(generate_signed)"
+    mapfile -t sig_files < <(find "$WORK" -maxdepth 1 -name 'report.sig.*' | sort)
+
+    # There should only be a single signature.
+    [ "${#sig_files[@]}" -eq 1 ]
+
+    signed_pub="$(verify_tpm2_sig "${sig_files[0]}" "$digest")"
+
+    # The report must be signed by exactly the key we created.
+    [ "$signed_pub" = "$created_pub" ]
+
+    echo "OK: single-key test '$name'"
+}
+
+# 0) Test that a default key is generated when no keys are provisioned.
+reset_state
+digest="$(generate_signed)"
+mapfile -t sig_files < <(find "$WORK" -maxdepth 1 -name 'report.sig.*' | sort)
+[ "${#sig_files[@]}" -eq 1 ]
+verify_tpm2_sig "${sig_files[0]}" "$digest" >/dev/null
+# Check that the generated key is stored under the default name.
+test -e "$KEY_DIR/default.key"
+
+echo "OK: default key test"
+
+# 1) RSA, RSASSA, 2048-bit, SHA-256 (primary key).
+test_single_key "rsa-rsassa-2048-sha256" \
+    '{"type":"primary","scheme":"rsassa","hashAlg":"sha256","rsaKeyBits":2048,"hierarchy":"owner"}' \
+    RSA SHA256 RSASSA 2048
+
+# 2) RSA, RSAPSS, 3072-bit, SHA-384 (primary key).
+test_single_key "rsa-rsapss-3072-sha384" \
+    '{"type":"primary","scheme":"rsapss","hashAlg":"sha384","rsaKeyBits":3072,"hierarchy":"owner"}' \
+    RSA SHA384 RSAPSS 3072
+
+# 3) ECC, ECDSA, NIST P-256, SHA-256 (primary key).
+test_single_key "ecc-ecdsa-p256-sha256" \
+    '{"type":"primary","scheme":"ecdsa","hashAlg":"sha256","eccCurve":"nistp256","hierarchy":"owner"}' \
+    ECC SHA256 ECDSA NIST_P256
+
+# 4) ECC, ECDSA, NIST P-384, SHA-512 (primary key).
+test_single_key "ecc-ecdsa-p384-sha512" \
+    '{"type":"primary","scheme":"ecdsa","hashAlg":"sha512","eccCurve":"nistp384","hierarchy":"owner"}' \
+    ECC SHA512 ECDSA NIST_P384
+
+# 5) An ordinary key, as a child of the EK.
+test_single_key "ordinary-ecdsa-p256" \
+    "$(jq -nc --argjson ph "$((EK_HANDLE))" '{"type":"ordinary", "scheme":"ecdsa", "hashAlg":"sha256", "eccCurve":"nistp256", "parentHandle":$ph}')" \
+    ECC SHA256 ECDSA NIST_P256
+
+# 6) A persistent key created as a primary object in the owner hierarchy.
+test_single_key "persistent-rsassa-2048" \
+    "$(jq -nc --argjson ph "$((PERSISTENT_HANDLE))" '{"type":"persistent", "scheme":"rsassa", "hashAlg":"sha256", "rsaKeyBits":2048, "hierarchy":"owner", "persistentHandle":$ph}')" \
+    RSA SHA256 RSASSA 2048
+
+# 7) Multiple keys: the report must be signed with each configured key, i.e. we
+#    get one TPM2 signature record per key.
+test_multi_key() {
+    if ! tpm2_supports_params rsa2048 rsassa-sha256 || ! tpm2_supports_params ecc_nist_p384 ecdsa-sha384; then
+        echo "TPM does not support the multi-key test parameters, skipping."
+        return 0
+    fi
+
+    local reply pub_rsa pub_ecc digest sig created_sorted report_sorted
+    local -a sig_files report_pubs
+
+    reset_state
+
+    reply="$(create_key "multi-rsa" '{"type":"primary","scheme":"rsassa","hashAlg":"sha256","rsaKeyBits":2048,"hierarchy":"owner"}')"
+    pub_rsa="$(jq -Sc .public <<<"$reply")"
+
+    reply="$(create_key "multi-ecc" '{"type":"primary","scheme":"ecdsa","hashAlg":"sha384","eccCurve":"nistp384","hierarchy":"owner"}')"
+    pub_ecc="$(jq -Sc .public <<<"$reply")"
+
+    test -e "$KEY_DIR/multi-rsa.key"
+    test -e "$KEY_DIR/multi-ecc.key"
+
+    digest="$(generate_signed)"
+    mapfile -t sig_files < <(find "$WORK" -maxdepth 1 -name 'report.sig.*' | sort)
+
+    # One TPM2 signature record per configured key.
+    [ "${#sig_files[@]}" -eq 2 ]
+
+    report_pubs=()
+    for sig in "${sig_files[@]}"; do
+        report_pubs+=("$(verify_tpm2_sig "$sig" "$digest")")
+    done
+
+    # The two reports must be signed by exactly the two (distinct) keys we created.
+    [ "$pub_rsa" != "$pub_ecc" ]
+    created_sorted="$(printf '%s\n' "$pub_rsa" "$pub_ecc" | sort)"
+    report_sorted="$(printf '%s\n' "${report_pubs[@]}" | sort)"
+    [ "$created_sorted" = "$report_sorted" ]
+
+    echo "OK: multi-key test"
+}
+test_multi_key
+
+# 8) Creating a key with an existing name must fail with KeyExists rather than
+#    overwriting it.
+test_key_exists() {
+    if ! tpm2_supports_params ecc_nist_p256 ecdsa-sha256; then
+        echo "TPM does not support the KeyExists test parameters, skipping."
+        return 0
+    fi
+
+    local dup_err
+
+    reset_state
+    create_key "dup-key" '{"type":"primary","scheme":"ecdsa","hashAlg":"sha256","eccCurve":"nistp256","hierarchy":"owner"}' >/dev/null
+    dup_err="$(varlinkctl call "$KEY_MANAGER" io.systemd.Report.TPM2SignerKeyManager.CreateKey \
+        '{"name":"dup-key","type":"primary","scheme":"ecdsa","hashAlg":"sha256","eccCurve":"nistp256","hierarchy":"owner"}' 2>&1 || true)"
+    echo "$dup_err" | grep "io.systemd.Report.TPM2SignerKeyManager.KeyExists" >/dev/null
+
+    echo "OK: KeyExists test"
+}
+test_key_exists
