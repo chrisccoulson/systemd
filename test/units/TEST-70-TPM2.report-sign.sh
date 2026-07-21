@@ -724,17 +724,27 @@ test_single_key "ecc-ecdsa-p384-sha512" \
     '{"type":"primary","scheme":"ecdsa","hashAlg":"sha512","eccCurve":"nistp384","hierarchy":"owner"}' \
     ECC SHA512 ECDSA NIST_P384
 
-# 5) An ordinary key, as a child of the EK.
+# 5) RSA, RSASSA, 2048-bit, SHA-256 (primary key, EH).
+test_single_key "rsa-rsassa-2048-sha256" \
+    '{"type":"primary","scheme":"rsassa","hashAlg":"sha256","rsaKeyBits":2048,"hierarchy":"endorsement"}' \
+    RSA SHA256 RSASSA 2048
+
+# 6) RSA, RSASSA, 2048-bit, SHA-256 (primary key, NH).
+test_single_key "rsa-rsassa-2048-sha256" \
+    '{"type":"primary","scheme":"rsassa","hashAlg":"sha256","rsaKeyBits":2048,"hierarchy":"null"}' \
+    RSA SHA256 RSASSA 2048
+
+# 7) An ordinary key, as a child of the EK.
 test_single_key "ordinary-ecdsa-p256" \
     "$(jq -nc --argjson ph "$((EK_HANDLE))" '{"type":"ordinary", "scheme":"ecdsa", "hashAlg":"sha256", "eccCurve":"nistp256", "parentHandle":$ph}')" \
     ECC SHA256 ECDSA NIST_P256
 
-# 6) A persistent key created as a primary object in the owner hierarchy.
+# 8) A persistent key created as a primary object in the owner hierarchy.
 test_single_key "persistent-rsassa-2048" \
     "$(jq -nc --argjson ph "$((PERSISTENT_HANDLE))" '{"type":"persistent", "scheme":"rsassa", "hashAlg":"sha256", "rsaKeyBits":2048, "hierarchy":"owner", "persistentHandle":$ph}')" \
     RSA SHA256 RSASSA 2048
 
-# 7) Multiple keys: the report must be signed with each configured key, i.e. we
+# 9) Multiple keys: the report must be signed with each configured key, i.e. we
 #    get one TPM2 signature record per key.
 test_multi_key() {
     if ! tpm2_supports_params rsa2048 rsassa-sha256 || ! tpm2_supports_params ecc_nist_p384 ecdsa-sha384; then
@@ -777,7 +787,7 @@ test_multi_key() {
 }
 test_multi_key
 
-# 8) Creating a key with an existing name must fail with KeyExists rather than
+# 10) Creating a key with an existing name must fail with KeyExists rather than
 #    overwriting it.
 test_key_exists() {
     if ! tpm2_supports_params ecc_nist_p256 ecdsa-sha256; then
@@ -805,7 +815,7 @@ delete_key() {
         "$(jq -nc --arg name "$1" '{name: $name}')"
 }
 
-# 9) Deleting a key removes all associated files.
+# 11) Deleting a key removes all associated files.
 test_delete_key() {
     if ! tpm2_supports_params ecc_nist_p256 ecdsa-sha256; then
         echo "TPM does not support the delete-key test parameters, skipping."
@@ -836,7 +846,7 @@ test_delete_key() {
 }
 test_delete_key
 
-# 10) Deleting a persistent key also evicts its object from the TPM.
+# 12) Deleting a persistent key also evicts its object from the TPM.
 test_delete_persistent_key() {
     if ! tpm2_supports_params rsa2048 rsassa-sha256; then
         echo "TPM does not support the delete-persistent test parameters, skipping."
@@ -861,7 +871,7 @@ test_delete_persistent_key() {
 }
 test_delete_persistent_key
 
-# 11) Deleting a key that doesn't exist must fail with NoSuchKey.
+# 13) Deleting a key that doesn't exist must fail with NoSuchKey.
 test_delete_no_such_key() {
     local err
 
