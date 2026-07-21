@@ -137,14 +137,15 @@ static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_signing_key_hierarchy, SigningKey
 typedef struct SigningKeyData {
         SigningKeyType type;
 
-        struct iovec parent_handle;
-        struct iovec public;
-        struct iovec private;
+        struct iovec parent_handle;    /* Persistent handle for the parent of ordinary keys */
+        struct iovec public;           /* Public area of ordinary keys */
+        struct iovec private;          /* Private area of ordinary keys */
 
-        struct iovec handle;
+        struct iovec handle;           /* Handle of persistent key. */
 
-        SigningKeyHierarchy hierarchy;
-        struct iovec template;
+        SigningKeyHierarchy hierarchy; /* Hierarchy in which to recreate primary key. */
+        struct iovec template;         /* Template used to recreate primary key. */
+        struct iovec name;             /* Expected name of primary key. */
 } SigningKeyData;
 
 static SigningKeyData *signing_key_data_free(SigningKeyData *d) {
@@ -158,6 +159,7 @@ static SigningKeyData *signing_key_data_free(SigningKeyData *d) {
         iovec_done(&d->handle);
 
         iovec_done(&d->template);
+        iovec_done(&d->name);
 
         return mfree(d);
 }
@@ -200,6 +202,7 @@ static int load_signing_key_data(int dir_fd, const char *fname, SigningKeyData *
                 { "handle",        SD_JSON_VARIANT_STRING,        json_dispatch_unhex_iovec,           offsetof(SigningKeyData, handle),        0                 },
                 { "hierarchy",     _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_signing_key_hierarchy, offsetof(SigningKeyData, hierarchy),     0                 },
                 { "template",      SD_JSON_VARIANT_STRING,        json_dispatch_unhex_iovec,           offsetof(SigningKeyData, template),      0                 },
+                { "name",          SD_JSON_VARIANT_STRING,        json_dispatch_unhex_iovec,           offsetof(SigningKeyData, name),          0                 },
                 {},
         };
 
@@ -277,7 +280,7 @@ static int generate_key(Tpm2Context *c, int dir_fd) {
 
         /* The EK requires a policy session for authorization. */
         _cleanup_(tpm2_handle_freep) Tpm2Handle *session = NULL;
-        r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, ek_handle, /* tpm_key= */ NULL, &session);
+        r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, ek_handle, &session);
         if (r < 0)
                 return log_error_errno(r, "Failed to open policy session for EK");
 
@@ -474,8 +477,10 @@ static int create_primary_key(
                 Tpm2Context *c,
                 SigningKeyHierarchy hierarchy,
                 const TPMT_PUBLIC *template,
+                TPM2B_NAME **ret_name,
                 TPM2B_PUBLIC **ret_public,
                 Tpm2Handle **ret_handle) {
+        int r;
 
         assert(c);
         assert(template);
@@ -498,15 +503,39 @@ static int create_primary_key(
                 .publicArea = *template,
         };
 
-        return tpm2_create_primary(c, /* session= */ NULL, hierarchy_esys, &template_tpm2b, /* sensitive= */ NULL, ret_public, ret_handle);
+        _cleanup_(Esys_Freep) TPM2B_PUBLIC *public = NULL;
+        _cleanup_(tpm2_handle_freep) Tpm2Handle *handle = NULL;
+        r = tpm2_create_primary(c, /* session= */ NULL, hierarchy_esys, &template_tpm2b, /* sensitive= */ NULL, &public, &handle);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create primary key");
+
+        _cleanup_(Esys_Freep) TPM2B_NAME *name = NULL;
+        if (ret_name) {
+                r = tpm2_get_name(c, handle, &name);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get name of primary key");
+
+                *ret_name = TAKE_PTR(name);
+        }
+        if (ret_public)
+                *ret_public = TAKE_PTR(public);
+        *ret_handle = TAKE_PTR(handle);
+
+        return 0;
 }
 
 /* Recreate a primary TPM key in the specified hierarchy, using the supplied template data. */
-static int recreate_primary_key(Tpm2Context *c, SigningKeyHierarchy hierarchy, const struct iovec *template, Tpm2Handle **ret) {
+static int recreate_primary_key(
+                Tpm2Context *c,
+                SigningKeyHierarchy hierarchy,
+                const struct iovec *template,
+                const struct iovec *expected_name,
+                Tpm2Handle **ret) {
         int r;
 
         assert(c);
         assert(iovec_is_valid(template));
+        assert(iovec_is_valid(expected_name));
         assert(ret);
 
         TPM2B_PUBLIC template_tpm2b;
@@ -514,10 +543,15 @@ static int recreate_primary_key(Tpm2Context *c, SigningKeyHierarchy hierarchy, c
         if (r < 0)
                 return log_error_errno(r, "Failed to unmarshal primary key template");
 
+        _cleanup_(Esys_Freep) TPM2B_NAME *name = NULL;
         _cleanup_(tpm2_handle_freep) Tpm2Handle *handle = NULL;
-        r = create_primary_key(c, hierarchy, &template_tpm2b.publicArea, /* ret_public= */ NULL, &handle);
+        r = create_primary_key(c, hierarchy, &template_tpm2b.publicArea, &name, /* ret_public= */ NULL, &handle);
         if (r < 0)
-                return log_error_errno(r, "Failed to recreate primary key");
+                return r;
+
+        if (memcmp_nn(expected_name->iov_base, expected_name->iov_len, name->name, name->size) != 0)
+                return log_warning_errno(SYNTHETIC_ERRNO(ENOKEY),
+                                       "Recreated primary attestation key does not have the expected name. This is likely because the primary seed of the TPM hierarchy has changed");
 
         log_debug("Acquired primary signing key handle.");
 
@@ -552,8 +586,8 @@ static int acquire_persistent_key(Tpm2Context *c, const struct iovec *handle_dat
                 return log_error_errno(r, "Failed to read name of persistent signing key from TPM");
 
         if (memcmp_nn(handle_name->name, handle_name->size, real_name->name, real_name->size) != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
-                                       "Persistent signing key handle does not match object in TPM");
+                return log_warning_errno(SYNTHETIC_ERRNO(ENOKEY),
+                                         "Persistent object in the TPM does not match the saved handle");
 
         log_debug("Acquired persistent signing key handle.");
 
@@ -592,16 +626,17 @@ static int load_ordinary_key(
         if (r < 0)
                 return log_error_errno(r, "Failed to unmarshal ordinary signing key private area");
 
-        /* We pass in the EK handle as the tpmKey parameter for the policy session. This is just to make
-         * sure that the policy session HMAC check will fail on the TPM if the handle we've deserialized
-         * from disk isn't consistent with the object that's actually in the TPM now. */
         _cleanup_(tpm2_handle_freep) Tpm2Handle *session = NULL;
-        r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, parent, parent, &session);
+        r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, parent, &session);
         if (r < 0)
                 return log_error_errno(r, "Failed to open policy session for EK");
 
         _cleanup_(tpm2_handle_freep) Tpm2Handle *handle = NULL;
         r = tpm2_load(c, parent, session, &public_tpm2b, &private_tpm2b, &handle);
+        if (r == -EREMOTE)
+                return log_warning_errno(SYNTHETIC_ERRNO(ENOKEY),
+                                         "Ordinary attestation key failed an integrity check when loading it into the TPM. "
+                                         "Either the storage key at the parent handle in the TPM isn't the correct one or the saved key data is invalid.");
         if (r < 0)
                 return log_error_errno(r, "Failed to load ordinary attestation key into the TPM");
 
@@ -730,7 +765,7 @@ static int acquire_key_handle(Tpm2Context *c, int runtime_dir_fd, const char *na
         case SIGNING_KEY_PRIMARY:
                 r = load_key_context(c, runtime_dir_fd, name, &handle);
                 if (r == -ENOENT) {
-                        r = recreate_primary_key(c, data->hierarchy, &data->template, &handle);
+                        r = recreate_primary_key(c, data->hierarchy, &data->template, &data->name, &handle);
                         if (r < 0)
                                 return r;
 
@@ -893,17 +928,21 @@ static int vl_method_sign(
         FOREACH_ARRAY(key, keys, n_keys) {
                 _cleanup_(tpm2_handle_freep) Tpm2Handle *key_handle = NULL;
                 r = acquire_key_handle(c, runtime_dir_fd, key->name, key->data, &key_handle);
+                if (r == -ENOKEY) {
+                        log_warning("The signing key '%s' is not available, skipping.", key->name);
+                        continue;
+                }
                 if (r < 0)
-                        return log_error_errno(r, "Failed to acquire a signing key handle for key %s", key->name);
+                        return log_error_errno(r, "Failed to acquire a signing key handle for key '%s'", key->name);
 
                 _cleanup_(tpm2_report_freep) Tpm2Report *report = NULL;
                 r = tpm2_generate_report(c, &opts, key_handle, &external_data, &report);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to generate TPM report with key %s", key->name);
+                        return log_error_errno(r, "Failed to generate TPM report with key '%s'", key->name);
 
                 r = build_report(&dv, report, &key->voucher);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to build TPM report JSON for key %s", key->name);
+                        return log_error_errno(r, "Failed to build TPM report JSON for key '%s'", key->name);
         }
 
         return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_VARIANT("data", dv));
@@ -1100,10 +1139,12 @@ static int reply_unsupported_template(sd_varlink *link, const char *parameter) {
 static int build_primary_key_data(
                 SigningKeyHierarchy hierarchy,
                 const TPMT_PUBLIC *template,
+                const TPM2B_NAME *name,
                 sd_json_variant **ret) {
         int r;
 
         assert(template);
+        assert(name);
         assert(ret);
 
         TPM2B_PUBLIC template_tpm2b = {
@@ -1123,7 +1164,8 @@ static int build_primary_key_data(
                         &v,
                         SD_JSON_BUILD_PAIR_STRING("type", signing_key_type_to_string(SIGNING_KEY_PRIMARY)),
                         SD_JSON_BUILD_PAIR_STRING("hierarchy", signing_key_hierarchy_to_string(hierarchy)),
-                        SD_JSON_BUILD_PAIR_HEX("template", template_buf, template_sz));
+                        SD_JSON_BUILD_PAIR_HEX("template", template_buf, template_sz),
+                        SD_JSON_BUILD_PAIR_HEX("name", name->name, name->size));
         if (r < 0)
                 return log_error_errno(r, "Failed to build signing key data");
 
@@ -1346,11 +1388,12 @@ static int vl_method_create_key(
         _cleanup_(tpm2_handle_freep) Tpm2Handle *handle = NULL, *parent = NULL;
         _cleanup_(Esys_Freep) TPM2B_PUBLIC *public = NULL;
         _cleanup_(Esys_Freep) TPM2B_PRIVATE *private = NULL;
+        _cleanup_(Esys_Freep) TPM2B_NAME *name = NULL;
 
         if (as_primary) {
                 /* This is the path for "primary" keys, or "persistent" keys with a hierarchy rather than
                  * parentHandle. */
-                r = create_primary_key(c, p.hierarchy, &template, &public, &handle);
+                r = create_primary_key(c, p.hierarchy, &template, &name, &public, &handle);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create new signing key in TPM: %m");
         } else {
@@ -1364,7 +1407,7 @@ static int vl_method_create_key(
 
                 /* If parentHandle corresponds to the EK, we may require a policy session for authorization. */
                 _cleanup_(tpm2_handle_freep) Tpm2Handle *session = NULL;
-                r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, parent, /* tpm_key= */ NULL, &session);
+                r = tpm2_open_ek_user_policy_session(c, /* session= */ NULL, parent, &session);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open policy session for EK");
 
@@ -1376,7 +1419,7 @@ static int vl_method_create_key(
                 if (p.type == SIGNING_KEY_PERSISTENT) {
                         /* If parentHandle corresponds to the EK, we may require a policy session for authorization. */
                         session = tpm2_handle_free(session);
-                        r = tpm2_open_ek_user_policy_session(c, session, parent, /* tpm_key= */ NULL, &session);
+                        r = tpm2_open_ek_user_policy_session(c, session, parent, &session);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to open policy session for EK");
 
@@ -1407,7 +1450,7 @@ static int vl_method_create_key(
                 break;
 
         case SIGNING_KEY_PRIMARY:
-                r = build_primary_key_data(p.hierarchy, &template, &kd);
+                r = build_primary_key_data(p.hierarchy, &template, name, &kd);
                 if (r < 0)
                         return r;
                 break;
