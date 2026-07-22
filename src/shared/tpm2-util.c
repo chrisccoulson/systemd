@@ -361,6 +361,46 @@ static void tpm2b_sensitive_data_erase_and_esys_freep(TPM2B_SENSITIVE_DATA **p) 
         sym_Esys_Free(*p);
 }
 
+static bool tpm2_supports_rsa_key_bits(Tpm2Context *c, uint16_t key_bits) {
+        static const TPMI_ALG_RSA_SCHEME schemes[] = { TPM2_ALG_RSASSA, TPM2_ALG_RSAPSS, TPM2_ALG_OAEP, TPM2_ALG_RSAES };
+        static const TPMI_ALG_HASH hash_algs[] = { TPM2_ALG_SHA256, TPM2_ALG_SHA384, TPM2_ALG_SHA1, TPM2_ALG_SHA512 };
+
+        TPMI_ALG_RSA_SCHEME try_scheme = TPM2_ALG_ERROR;
+        FOREACH_ELEMENT(scheme, schemes) {
+                if (tpm2_supports_alg(c, *scheme)) {
+                        try_scheme = *scheme;
+                        break;
+                }
+        }
+        if (try_scheme == TPM2_ALG_ERROR)
+                return false; /* No supported RSA schemes. */
+
+        TPMI_ALG_HASH try_hash = TPM2_ALG_ERROR;
+        FOREACH_ELEMENT(hash, hash_algs) {
+                if (tpm2_supports_alg(c, *hash)) {
+                        try_hash = *hash;
+                        break;
+                }
+        }
+        /* We can continue here without a hash as the encryption schemes don't require one. */
+
+        TPMU_PUBLIC_PARMS parms = {
+                .rsaDetail = {
+                        .symmetric.algorithm = TPM2_ALG_NULL,
+                        .scheme = {
+                                .scheme = try_scheme,
+                                /* We're ok to set this unconditionally. If the scheme is an encryption one,
+                                 * then the value just won't be serialized. */
+                                .details.anySig.hashAlg = try_hash,
+                        },
+                        .keyBits = key_bits,
+                        .exponent = 0,
+                },
+        };
+
+        return tpm2_test_parms(c, TPM2_ALG_RSA, &parms);
+}
+
 /* Get a specific TPM capability (or capabilities).
  *
  * Returns 0 if there are no more capability properties of the requested type, or 1 if there are more, or < 0
@@ -704,6 +744,20 @@ static int tpm2_cache_capabilities(Tpm2Context *c) {
                 current_ecc_curve = ecc_curves.eccCurves[ecc_curves.count - 1] + 1;
         }
 
+        /* Cache the supported RSA key sizes. The TPM doesn't provide a capability for this, so we probe
+         * known key sizes with a template. */
+        static const uint16_t rsa_key_sizes[] = { 2048, 3072, 4096, 8192, 16384 };
+        FOREACH_ELEMENT(sz, rsa_key_sizes) {
+                if (!tpm2_supports_rsa_key_bits(c, *sz))
+                        continue;
+
+                if (!GREEDY_REALLOC_APPEND(
+                                c->capability_rsa_key_sizes,
+                                c->n_capability_rsa_key_sizes,
+                                sz, 1))
+                        return log_oom_debug();
+        }
+
         /* Cache the PCR capabilities, which are safe to cache, as the only way they can change is
          * TPM2_PCR_Allocate(), which changes the allocation after the next _TPM_Init(). If the TPM is
          * reinitialized while we are using it, all our context and sessions will be invalid, so we can
@@ -970,6 +1024,7 @@ static Tpm2Context *tpm2_context_free(Tpm2Context *c) {
 
         c->capability_algorithms = mfree(c->capability_algorithms);
         c->capability_commands = mfree(c->capability_commands);
+        c->capability_rsa_key_sizes = mfree(c->capability_rsa_key_sizes);
         c->capability_ecc_curves = mfree(c->capability_ecc_curves);
 
         c->tcti_driver = mfree(c->tcti_driver);
