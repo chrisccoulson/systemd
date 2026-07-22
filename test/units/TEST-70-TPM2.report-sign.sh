@@ -561,7 +561,7 @@ create_key() {
 # $2: type (RSA|ECC).
 # $3: digest algorithm (SHA256|SHA384|SHA512).
 # $4: scheme (RSASSA|RSAPSS|ECDSA).
-# $5: RSA key size in bits, or ECC curve ID (NIST_P256|NIST_P384).
+# $5: RSA key size in bits, or ECC curve ID (NIST_P224|NIST_P256|NIST_P384|NIST_P521).
 check_reply() {
     local reply="$1" kind="$2" name_alg="$3" scheme="$4" param="$5" pub
 
@@ -1305,3 +1305,71 @@ test_list_keys_primary_unavailable() {
     echo "OK: list-keys-primary-unavailable test"
 }
 test_list_keys_primary_unavailable
+
+# 23) GetSupportedParams reports exactly the parameters that the TPM supports,
+#     and every reported value can be used to create a key.
+test_get_supported_params() {
+    local params algs curves value reply
+    local -a expected
+
+    params="$(varlinkctl call "$KEY_MANAGER" io.systemd.Report.TPM2SignerKeyManager.GetSupportedParams '{}')"
+
+    # Signing schemes and digest algorithms are reported in the order they're defined
+    # in the IDL, if the TPM supports the corresponding algorithm.
+    algs="$(tpm2_getcap algorithms)"
+
+    expected=()
+    for value in rsassa rsapss ecdsa; do
+        if grep "^$value:" <<<"$algs" >/dev/null; then
+            expected+=("$value")
+        fi
+    done
+    [ "$(jq -c .schemes <<<"$params")" = "$(jq -nc '$ARGS.positional' --args "${expected[@]}")" ]
+
+    expected=()
+    for value in sha256 sha384 sha512; do
+        if grep "^$value:" <<<"$algs" >/dev/null; then
+            expected+=("$value")
+        fi
+    done
+    [ "$(jq -c .hashAlgs <<<"$params")" = "$(jq -nc '$ARGS.positional' --args "${expected[@]}")" ]
+
+    # RSA key sizes are probed from a known list.
+    expected=()
+    for value in 2048 3072 4096 8192 16384; do
+        if tpm2_supports_params "rsa$value"; then
+            expected+=("$value")
+        fi
+    done
+    [ "$(jq -c .rsaKeySizes <<<"$params")" = "$(jq -nc '$ARGS.positional | map(tonumber)' --args "${expected[@]}")" ]
+
+    # Curves are reported if the TPM supports them.
+    curves="$(tpm2_getcap ecc-curves)"
+    expected=()
+    for value in nistp224 nistp256 nistp384 nistp521; do
+        if grep "^TPM2_ECC_NIST_P${value#nistp}:" <<<"$curves" >/dev/null; then
+            expected+=("$value")
+        fi
+    done
+    [ "$(jq -c .eccCurves <<<"$params")" = "$(jq -nc '$ARGS.positional' --args "${expected[@]}")" ]
+
+    # Every reported RSA key size and curve must be accepted by CreateKey.
+    reset_state
+    if jq -e '.schemes | index("rsassa") != null' <<<"$params" >/dev/null; then
+        for value in $(jq -r '.rsaKeySizes[]' <<<"$params"); do
+            reply="$(create_key "supported-rsa$value" \
+                "$(jq -nc --argjson kb "$value" '{"type":"primary","scheme":"rsassa","hashAlg":"sha256","rsaKeyBits":$kb,"hierarchy":"null"}')")"
+            check_reply "$reply" RSA SHA256 RSASSA "$value"
+        done
+    fi
+    if jq -e '.schemes | index("ecdsa") != null' <<<"$params" >/dev/null; then
+        for value in $(jq -r '.eccCurves[]' <<<"$params"); do
+            reply="$(create_key "supported-$value" \
+                "$(jq -nc --arg c "$value" '{"type":"primary","scheme":"ecdsa","hashAlg":"sha256","eccCurve":$c,"hierarchy":"null"}')")"
+            check_reply "$reply" ECC SHA256 ECDSA "NIST_P${value#nistp}"
+        done
+    fi
+
+    echo "OK: get-supported-params test"
+}
+test_get_supported_params

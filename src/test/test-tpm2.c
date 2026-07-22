@@ -1313,6 +1313,39 @@ static void check_supports_alg(Tpm2Context *c) {
         assert_se(tpm2_supports_alg(c, TPM2_ALG_CFB));
 }
 
+static void check_rsa_key_sizes(Tpm2Context *c) {
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        if (!tpm2_supports_alg(c, TPM2_ALG_RSA)) {
+                ASSERT_EQ(c->n_capability_rsa_key_sizes, 0u);
+                return;
+        }
+
+        /* We should be able to expect all TPMs that support RSA support 2048 bit keys. */
+        ASSERT_GT(c->n_capability_rsa_key_sizes, 0u);
+        ASSERT_EQ(c->capability_rsa_key_sizes[0], 2048u);
+
+        uint16_t prev = 0;
+        FOREACH_ARRAY(sz, c->capability_rsa_key_sizes, c->n_capability_rsa_key_sizes) {
+                /* Only known key sizes are probed, in ascending order. */
+                ASSERT_TRUE(IN_SET(*sz, 2048, 3072, 4096, 8192, 16384));
+                ASSERT_GT(*sz, prev);
+                prev = *sz;
+
+                /* Every cached key size must be usable for a signing key. */
+                TPMU_PUBLIC_PARMS parms = {
+                        .rsaDetail = {
+                                .symmetric.algorithm = TPM2_ALG_NULL,
+                                .scheme.scheme = TPM2_ALG_NULL,
+                                .keyBits = *sz,
+                        },
+                };
+                ASSERT_TRUE(tpm2_test_parms(c, TPM2_ALG_RSA, &parms));
+        }
+}
+
 static void check_supports_command(Tpm2Context *c) {
         assert(c);
 
@@ -2390,6 +2423,7 @@ TEST_RET(tests_which_require_tpm) {
 
         check_test_parms(c);
         check_supports_alg(c);
+        check_rsa_key_sizes(c);
         check_supports_command(c);
         check_best_srk_template(c);
         check_get_or_create_srk(c);
