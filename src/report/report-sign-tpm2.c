@@ -970,8 +970,21 @@ static const char* const signing_scheme_table[_SIGNING_SCHEME_MAX] = {
         [SIGNING_SCHEME_RSAPSS] = "rsapss",
         [SIGNING_SCHEME_ECDSA]  = "ecdsa",
 };
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(signing_scheme, SigningScheme);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(signing_scheme, SigningScheme);
 static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_signing_scheme, SigningScheme, signing_scheme_from_string);
+
+static TPMI_ALG_ASYM_SCHEME signing_scheme_to_tpm(SigningScheme scheme) {
+        switch (scheme) {
+        case SIGNING_SCHEME_RSASSA:
+                return TPM2_ALG_RSASSA;
+        case SIGNING_SCHEME_RSAPSS:
+                return TPM2_ALG_RSAPSS;
+        case SIGNING_SCHEME_ECDSA:
+                return TPM2_ALG_ECDSA;
+        default:
+                return TPM2_ALG_ERROR;
+        }
+}
 
 typedef enum HashAlgorithm {
         HASH_ALGORITHM_SHA256,
@@ -987,7 +1000,7 @@ static const char* const hash_algorithm_table[_HASH_ALGORITHM_MAX] = {
         [HASH_ALGORITHM_SHA384] = "sha384",
         [HASH_ALGORITHM_SHA512] = "sha512",
 };
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(hash_algorithm, HashAlgorithm);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(hash_algorithm, HashAlgorithm);
 static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_hash_algorithm, HashAlgorithm, hash_algorithm_from_string);
 
 static TPMI_ALG_HASH hash_algorithm_to_tpm(HashAlgorithm alg) {
@@ -1004,6 +1017,7 @@ static TPMI_ALG_HASH hash_algorithm_to_tpm(HashAlgorithm alg) {
 }
 
 typedef enum ECCCurve {
+        ECC_CURVE_NISTP224,
         ECC_CURVE_NISTP256,
         ECC_CURVE_NISTP384,
         ECC_CURVE_NISTP521,
@@ -1013,11 +1027,12 @@ typedef enum ECCCurve {
 } ECCCurve;
 
 static const char* const ecc_curve_table[_ECC_CURVE_MAX] = {
+        [ECC_CURVE_NISTP224] = "nistp224",
         [ECC_CURVE_NISTP256] = "nistp256",
         [ECC_CURVE_NISTP384] = "nistp384",
         [ECC_CURVE_NISTP521] = "nistp521",
 };
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(ecc_curve, ECCCurve);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(ecc_curve, ECCCurve);
 static JSON_DISPATCH_ENUM_DEFINE(json_dispatch_ecc_curve, ECCCurve, ecc_curve_from_string);
 
 static TPMI_ECC_CURVE ecc_curve_to_tpm(ECCCurve c) {
@@ -1850,6 +1865,76 @@ static int vl_method_list_keys(
         return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
+static int vl_method_get_supported_params(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+
+        int r;
+
+        _cleanup_(tpm2_context_unrefp) Tpm2Context *c = NULL;
+        r = tpm2_context_new_or_warn(/* device= */ NULL, &c);
+        if (r < 0)
+                return r;
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *schemes = NULL;
+        r = sd_json_variant_new_array(&schemes, /* array= */ NULL, /* n= */ 0);
+        if (r < 0)
+                return r;
+        for (SigningScheme s = 0; s <= _SIGNING_SCHEME_MAX; s++) {
+                if (!tpm2_supports_alg(c, signing_scheme_to_tpm(s)))
+                        continue;
+
+                r = sd_json_variant_append_arrayb(&schemes, SD_JSON_VARIANT_STRING, signing_scheme_to_string(s));
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *hash_algs = NULL;
+        r = sd_json_variant_new_array(&hash_algs, /* array= */ NULL, /* n= */ 0);
+        if (r < 0)
+                return r;
+        for (HashAlgorithm a = 0; a <= _HASH_ALGORITHM_MAX; a++) {
+                if (!tpm2_supports_alg(c, hash_algorithm_to_tpm(a)))
+                        continue;
+
+                r = sd_json_variant_append_arrayb(&hash_algs, SD_JSON_VARIANT_STRING, hash_algorithm_to_string(a));
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *rsa_key_sizes = NULL;
+        r = sd_json_variant_new_array(&rsa_key_sizes, /* array= */ NULL, /* n= */ 0);
+        if (r < 0)
+                return r;
+        FOREACH_ARRAY(sz, c->capability_rsa_key_sizes, c->n_capability_rsa_key_sizes) {
+                r = sd_json_variant_append_arrayb(&rsa_key_sizes, SD_JSON_VARIANT_UNSIGNED, *sz);
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ecc_curves = NULL;
+        r = sd_json_variant_new_array(&ecc_curves, /* array= */ NULL, /* n= */ 0);
+        if (r < 0)
+                return r;
+        for (ECCCurve e = 0; e <= _ECC_CURVE_MAX; e++) {
+                if (!tpm2_supports_ecc_curve(c, ecc_curve_to_tpm(e)))
+                        continue;
+
+                r = sd_json_variant_append_arrayb(&ecc_curves, SD_JSON_VARIANT_STRING, ecc_curve_to_string(e));
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_varlink_replybo(
+                        link,
+                        SD_JSON_BUILD_PAIR_VARIANT("schemes", schemes),
+                        SD_JSON_BUILD_PAIR_VARIANT("hashAlgs", hash_algs),
+                        SD_JSON_BUILD_PAIR_VARIANT("rsaKeySizes", rsa_key_sizes),
+                        SD_JSON_BUILD_PAIR_VARIANT("eccCurves", ecc_curves));
+}
+
 static int vl_server(void) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *vs = NULL;
         int r;
@@ -1866,10 +1951,11 @@ static int vl_server(void) {
 
         r = sd_varlink_server_bind_method_many(
                         vs,
-                        "io.systemd.Report.Signer.Sign",                    vl_method_sign,
-                        "io.systemd.Report.TPM2SignerKeyManager.CreateKey", vl_method_create_key,
-                        "io.systemd.Report.TPM2SignerKeyManager.DeleteKey", vl_method_delete_key,
-                        "io.systemd.Report.TPM2SignerKeyManager.ListKeys",  vl_method_list_keys);
+                        "io.systemd.Report.Signer.Sign",                             vl_method_sign,
+                        "io.systemd.Report.TPM2SignerKeyManager.CreateKey",          vl_method_create_key,
+                        "io.systemd.Report.TPM2SignerKeyManager.DeleteKey",          vl_method_delete_key,
+                        "io.systemd.Report.TPM2SignerKeyManager.ListKeys",           vl_method_list_keys,
+                        "io.systemd.Report.TPM2SignerKeyManager.GetSupportedParams", vl_method_get_supported_params);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind Varlink methods: %m");
 

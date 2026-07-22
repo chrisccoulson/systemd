@@ -90,6 +90,8 @@ typedef struct Tpm2Context {
         size_t n_capability_algorithms;
         TPMA_CC *capability_commands;
         size_t n_capability_commands;
+        uint16_t *capability_rsa_key_sizes;
+        size_t n_capability_rsa_key_sizes;
         TPM2_ECC_CURVE *capability_ecc_curves;
         size_t n_capability_ecc_curves;
         TPML_PCR_SELECTION capability_pcrs;

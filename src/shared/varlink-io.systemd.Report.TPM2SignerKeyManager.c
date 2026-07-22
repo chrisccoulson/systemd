@@ -31,6 +31,8 @@ static SD_VARLINK_DEFINE_ENUM_TYPE(
 
 static SD_VARLINK_DEFINE_ENUM_TYPE(
                 ECCCurve,
+                SD_VARLINK_FIELD_COMMENT("224-bit prime field Weierstrass curve, also known as secp224r1, wap-wsg-idm-ecid-wtls12 or ansip224r1"),
+                SD_VARLINK_DEFINE_ENUM_VALUE(nistp224),
                 SD_VARLINK_FIELD_COMMENT("256-bit prime field Weierstrass curve, also known as secp256r1 or prime256v1."),
                 SD_VARLINK_DEFINE_ENUM_VALUE(nistp256),
                 SD_VARLINK_FIELD_COMMENT("384-bit prime field Weierstrass curve, also known as secp384r1 or ansip384r1."),
@@ -110,6 +112,17 @@ static SD_VARLINK_DEFINE_METHOD_FULL(
                 SD_VARLINK_FIELD_COMMENT("The base64 encoded voucher associated with this signing key, if one exists. The format of the voucher is not specified."),
                 SD_VARLINK_DEFINE_OUTPUT(voucher, SD_VARLINK_STRING, SD_VARLINK_NULLABLE));
 
+static SD_VARLINK_DEFINE_METHOD(
+                GetSupportedParams,
+                SD_VARLINK_FIELD_COMMENT("The supported signing schemes."),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(schemes, SigningScheme, SD_VARLINK_ARRAY),
+                SD_VARLINK_FIELD_COMMENT("The supported digest algorithms."),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(hashAlgs, HashAlgorithm, SD_VARLINK_ARRAY),
+                SD_VARLINK_FIELD_COMMENT("The supported RSA key sizes, in bits."),
+                SD_VARLINK_DEFINE_OUTPUT(rsaKeySizes, SD_VARLINK_INT, SD_VARLINK_ARRAY),
+                SD_VARLINK_FIELD_COMMENT("The supported elliptic curves."),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(eccCurves, ECCCurve, SD_VARLINK_ARRAY));
+
 static SD_VARLINK_DEFINE_ERROR(KeyExists);
 
 static SD_VARLINK_DEFINE_ERROR(
@@ -131,6 +144,8 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_method_DeleteKey,
                 SD_VARLINK_SYMBOL_COMMENT("List available signing keys."),
                 &vl_method_ListKeys,
+                SD_VARLINK_SYMBOL_COMMENT("Get all values supported by the TPM for parameters that can be supplied to CreateKey."),
+                &vl_method_GetSupportedParams,
                 SD_VARLINK_SYMBOL_COMMENT("A signing key with the requested name already exists."),
                 &vl_error_KeyExists,
                 SD_VARLINK_SYMBOL_COMMENT("The requested combination of key template parameters (signing scheme, digest algorithm, RSA key size or elliptic curve) is not supported by the TPM."),
