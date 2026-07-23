@@ -1373,3 +1373,101 @@ test_get_supported_params() {
     echo "OK: get-supported-params test"
 }
 test_get_supported_params
+
+# 24) Template parameters that are omitted from CreateKey are filled in, by
+#     preferring a standard template that matches the supplied parameters, and
+#     otherwise overlaying the supplied parameters on to the most preferred
+#     standard template.
+test_single_key "default-template" \
+    '{"type":"primary","hierarchy":"owner"}' \
+    ECC SHA384 ECDSA NIST_P384
+test_single_key "default-template-null" \
+    '{"type":"primary","hierarchy":"owner","scheme":null,"hashAlg":null,"rsaKeyBits":null,"eccCurve":null}' \
+    ECC SHA384 ECDSA NIST_P384
+test_single_key "scheme-only-rsassa" \
+    '{"type":"primary","hierarchy":"owner","scheme":"rsassa"}' \
+    RSA SHA384 RSASSA 3072
+test_single_key "scheme-only-ecdsa" \
+    '{"type":"primary","hierarchy":"owner","scheme":"ecdsa"}' \
+    ECC SHA384 ECDSA NIST_P384
+test_single_key "hashalg-only-sha256" \
+    '{"type":"primary","hierarchy":"owner","hashAlg":"sha256"}' \
+    ECC SHA256 ECDSA NIST_P256
+test_single_key "hashalg-only-sha512" \
+    '{"type":"primary","hierarchy":"owner","hashAlg":"sha512"}' \
+    ECC SHA512 ECDSA NIST_P521
+test_single_key "rsakeybits-only-2048" \
+    '{"type":"primary","hierarchy":"owner","rsaKeyBits":2048}' \
+    RSA SHA256 RSAPSS 2048
+test_single_key "ecccurve-only-nistp256" \
+    '{"type":"primary","hierarchy":"owner","eccCurve":"nistp256"}' \
+    ECC SHA256 ECDSA NIST_P256
+test_single_key "ecccurve-only-nistp224" \
+    '{"type":"primary","hierarchy":"owner","eccCurve":"nistp224"}' \
+    ECC SHA256 ECDSA NIST_P224
+test_single_key "overlay-ecc" \
+    '{"type":"primary","hierarchy":"owner","scheme":"ecdsa","hashAlg":"sha512","eccCurve":"nistp256"}' \
+    ECC SHA512 ECDSA NIST_P256
+test_single_key "overlay-rsa" \
+    '{"type":"primary","hierarchy":"owner","hashAlg":"sha384","rsaKeyBits":2048}' \
+    RSA SHA384 RSAPSS 2048
+
+# Call CreateKey, expecting it to fail with the specified error.
+#
+# $1: name.
+# $2: JSON parameters (the name is injected).
+# $3: the expected error.
+#
+# Prints the error parameters.
+create_key_expect_error() {
+    local name="$1" params="$2" error="$3" reply
+
+    reply="$(varlinkctl call --graceful="$error" "$KEY_MANAGER" io.systemd.Report.TPM2SignerKeyManager.CreateKey \
+        "$(jq -nc --arg name "$name" --argjson p "$params" '$p + {name: $name}')")"
+
+    # A successful reply would carry the new key's public area. An error without
+    # parameters produces no output at all.
+    if [ -n "$reply" ]; then
+        jq -e '.public == null' <<<"$reply" >/dev/null
+    fi
+    test ! -e "$KEY_DIR/$name.key"
+
+    echo "$reply"
+}
+
+# 25) Template parameters that are inconsistent with each other or that the TPM
+#     doesn't support are refused.
+test_create_key_invalid_template() {
+    local reply
+
+    reset_state
+
+    # Parameters for different key types can't be mixed.
+    reply="$(create_key_expect_error "invalid-ecdsa-rsakeybits" \
+        '{"type":"primary","hierarchy":"owner","scheme":"ecdsa","rsaKeyBits":2048}' \
+        org.varlink.service.InvalidParameter)"
+    [ "$(jq -r .parameter <<<"$reply")" = "rsaKeyBits" ]
+
+    reply="$(create_key_expect_error "invalid-rsassa-ecccurve" \
+        '{"type":"primary","hierarchy":"owner","scheme":"rsassa","eccCurve":"nistp256"}' \
+        org.varlink.service.InvalidParameter)"
+    [ "$(jq -r .parameter <<<"$reply")" = "eccCurve" ]
+
+    reply="$(create_key_expect_error "invalid-ecccurve-rsakeybits" \
+        '{"type":"primary","hierarchy":"owner","eccCurve":"nistp256","rsaKeyBits":2048}' \
+        org.varlink.service.InvalidParameter)"
+    [ "$(jq -r .parameter <<<"$reply")" = "rsaKeyBits" ]
+
+    reply="$(create_key_expect_error "invalid-rsakeybits-too-large" \
+        '{"type":"primary","hierarchy":"owner","rsaKeyBits":65536}' \
+        org.varlink.service.InvalidParameter)"
+    [ "$(jq -r .parameter <<<"$reply")" = "rsaKeyBits" ]
+
+    # A key size that no TPM supports.
+    create_key_expect_error "unsupported-rsakeybits" \
+        '{"type":"primary","hierarchy":"owner","rsaKeyBits":1234}' \
+        io.systemd.Report.TPM2SignerKeyManager.UnsupportedTemplate >/dev/null
+
+    echo "OK: create-key-invalid-template test"
+}
+test_create_key_invalid_template

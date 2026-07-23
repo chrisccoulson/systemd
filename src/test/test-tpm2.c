@@ -1888,7 +1888,7 @@ typedef struct AkTemplateParams {
         uint16_t param; /* RSA key bits or ECC curve ID */
 } AkTemplateParams;
 
-/* The attestation key templates, in order of preference. */
+/* The default attestation key templates, in order of preference. */
 static const AkTemplateParams ak_templates[] = {
         { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA384, TPM2_ECC_NIST_P384 },
         { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA256, TPM2_ECC_NIST_P256 },
@@ -1900,6 +1900,8 @@ static const AkTemplateParams ak_templates[] = {
         { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA256, 2048               },
         { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA384, 4096               },
         { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA384, 4096               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA512, 4096               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 4096               },
         { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA512, 8192               },
         { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 8192               },
         { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA512, 16384              },
@@ -1981,14 +1983,58 @@ static void hide_ecc_curve(Tpm2Context *c, TPM2_ECC_CURVE curve) {
         c->n_capability_ecc_curves = n;
 }
 
-static const AkTemplateParams *first_supported_ak_template(Tpm2Context *c) {
+/* Return the most preferred attestation key template that matches the supplied constraints and that the TPM
+ * supports. */
+static const AkTemplateParams *first_supported_ak_template(
+                Tpm2Context *c,
+                TPMI_ALG_PUBLIC type,
+                TPMI_ALG_ASYM_SCHEME scheme,
+                TPMI_ALG_HASH hash_alg) {
+
         assert(c);
 
-        FOREACH_ELEMENT(p, ak_templates)
+        FOREACH_ELEMENT(p, ak_templates) {
+                if (type != TPM2_ALG_NULL && p->type != type)
+                        continue;
+                if (scheme != TPM2_ALG_NULL && p->scheme != scheme)
+                        continue;
+                if (hash_alg != TPM2_ALG_NULL && p->hash_alg != hash_alg)
+                        continue;
+
                 if (supports_ak_template(c, p))
                         return p;
+        }
 
         return NULL;
+}
+
+/* Check the result of a call that selects an attestation key template, if the TPM supports the expected
+ * template. */
+static void check_selected_ak_template(
+                Tpm2Context *c,
+                int r,
+                const TPMT_PUBLIC *template,
+                const AkTemplateParams *expected) {
+
+        assert(c);
+        assert(template);
+        assert(expected);
+
+        if (!supports_ak_template(c, expected)) {
+                log_notice("TPM does not support expected template, skipping.");
+                return;
+        }
+
+        ASSERT_OK(r);
+        assert_ak_template(template, expected);
+}
+
+/* Replace the context's cached ECC curves, e.g. to restore them after hide_ecc_curve(). */
+static void set_ecc_curves(Tpm2Context *c, const TPM2_ECC_CURVE *curves, size_t n_curves) {
+        assert(c);
+
+        memcpy_safe(c->capability_ecc_curves, curves, n_curves * sizeof(TPM2_ECC_CURVE));
+        c->n_capability_ecc_curves = n_curves;
 }
 
 static void check_best_attestation_key_template(Tpm2Context *c) {
@@ -2004,7 +2050,7 @@ static void check_best_attestation_key_template(Tpm2Context *c) {
         /* Walk down the list of preferred templates by hiding the curve of each selected ECC template in
          * turn, until an RSA template is selected. */
         for (;;) {
-                const AkTemplateParams *expected = ASSERT_NOT_NULL(first_supported_ak_template(c));
+                const AkTemplateParams *expected = ASSERT_NOT_NULL(first_supported_ak_template(c, TPM2_ALG_NULL, TPM2_ALG_NULL, TPM2_ALG_NULL));
 
                 TPMT_PUBLIC template;
                 ASSERT_OK(tpm2_get_best_attestation_key_template(c, &template));
@@ -2016,8 +2062,179 @@ static void check_best_attestation_key_template(Tpm2Context *c) {
                 hide_ecc_curve(c, expected->param);
         }
 
-        memcpy(c->capability_ecc_curves, saved_curves, n_saved_curves * sizeof(TPM2_ECC_CURVE));
-        c->n_capability_ecc_curves = n_saved_curves;
+        set_ecc_curves(c, saved_curves, n_saved_curves);
+}
+
+static void check_best_attestation_key_templatex(Tpm2Context *c) {
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        TPMT_PUBLIC template;
+        int r;
+
+        /* Without constraints, this is the same as tpm2_get_best_attestation_key_template(). */
+        ASSERT_OK(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, &template));
+        assert_ak_template(&template, ASSERT_NOT_NULL(first_supported_ak_template(c, TPM2_ALG_NULL, TPM2_ALG_NULL, TPM2_ALG_NULL)));
+
+        /* Invalid signing schemes are refused. */
+        ASSERT_ERROR(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_SHA256, TPM2_ALG_NULL, &template), EINVAL);
+        ASSERT_ERROR(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_ECDAA, TPM2_ALG_NULL, &template), EINVAL);
+
+        /* A signing scheme selects the most preferred template with that scheme. */
+        FOREACH_ELEMENT(scheme, ((const TPMI_ALG_ASYM_SCHEME[]) { TPM2_ALG_ECDSA, TPM2_ALG_RSASSA, TPM2_ALG_RSAPSS })) {
+                const AkTemplateParams *expected = first_supported_ak_template(c, TPM2_ALG_NULL, *scheme, TPM2_ALG_NULL);
+                if (!expected) {
+                        log_notice("TPM does not support signing scheme 0x%" PRIx16 ", skipping.", *scheme);
+                        continue;
+                }
+
+                ASSERT_OK(tpm2_get_best_attestation_key_templatex(c, *scheme, TPM2_ALG_NULL, &template));
+                assert_ak_template(&template, expected);
+        }
+
+        /* A digest algorithm selects the most preferred template with that digest. */
+        r = tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA256, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA256, TPM2_ECC_NIST_P256 });
+
+        r = tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA384, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA384, TPM2_ECC_NIST_P384 });
+
+        r = tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA512, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA512, TPM2_ECC_NIST_P521 });
+
+        size_t n_saved_curves = c->n_capability_ecc_curves;
+        _cleanup_free_ TPM2_ECC_CURVE *saved_curves =
+                ASSERT_NOT_NULL(newdup(TPM2_ECC_CURVE, c->capability_ecc_curves, n_saved_curves));
+
+        /* Without NIST P-521, SHA-512 selects one of the large RSA templates. If none of those are supported
+         * either, then SHA-512 is overlaid on to the most preferred template instead. */
+        hide_ecc_curve(c, TPM2_ECC_NIST_P521);
+        if (tpm2_supports_alg(c, TPM2_ALG_SHA512)) {
+                ASSERT_OK(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA512, &template));
+
+                const AkTemplateParams *expected = first_supported_ak_template(c, TPM2_ALG_NULL, TPM2_ALG_NULL, TPM2_ALG_SHA512);
+                if (expected)
+                        assert_ak_template(&template, expected);
+                else {
+                        AkTemplateParams overlaid = *ASSERT_NOT_NULL(first_supported_ak_template(c, TPM2_ALG_NULL, TPM2_ALG_NULL, TPM2_ALG_NULL));
+                        overlaid.hash_alg = TPM2_ALG_SHA512;
+                        assert_ak_template(&template, &overlaid);
+                }
+        }
+
+        /* Without any ECC curves, ECDSA is unsupported and RSA is selected instead. */
+        set_ecc_curves(c, NULL, 0);
+        ASSERT_ERROR(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_ECDSA, TPM2_ALG_NULL, &template), EOPNOTSUPP);
+        ASSERT_OK(tpm2_get_best_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, &template));
+        ASSERT_EQ(template.type, TPM2_ALG_RSA);
+
+        set_ecc_curves(c, saved_curves, n_saved_curves);
+}
+
+static void check_best_rsa_attestation_key_templatex(Tpm2Context *c) {
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        TPMT_PUBLIC template;
+        int r;
+
+        if (!tpm2_supports_alg(c, TPM2_ALG_RSA)) {
+                ASSERT_ERROR(tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, 0, &template), EOPNOTSUPP);
+                return;
+        }
+
+        /* Non-RSA signing schemes are refused. */
+        ASSERT_ERROR(tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_ECDSA, TPM2_ALG_NULL, 0, &template), EINVAL);
+        ASSERT_ERROR(tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_OAEP, TPM2_ALG_NULL, 0, &template), EINVAL);
+
+        /* Without constraints, the most preferred RSA template is selected. */
+        ASSERT_OK(tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, 0, &template));
+        assert_ak_template(&template, ASSERT_NOT_NULL(first_supported_ak_template(c, TPM2_ALG_RSA, TPM2_ALG_NULL, TPM2_ALG_NULL)));
+
+        /* Constraints that match a standard template select it. */
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_RSASSA, TPM2_ALG_NULL, 0, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA384, 3072 });
+
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, 2048, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA256, 2048 });
+
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA256, 0, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA256, 2048 });
+
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_RSASSA, TPM2_ALG_SHA256, 2048, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA256, 2048 });
+
+        /* Constraints that don't match a standard template are overlaid on to the most preferred one. */
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_SHA384, 2048, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA384, 2048 });
+
+        r = tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 2048, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 2048 });
+
+        /* Unsupported key sizes are refused. */
+        ASSERT_ERROR(tpm2_get_best_rsa_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ALG_NULL, 1234, &template), EOPNOTSUPP);
+}
+
+static void check_best_ecc_attestation_key_templatex(Tpm2Context *c) {
+        assert(c);
+
+        TEST_LOG_FUNC();
+
+        TPMT_PUBLIC template;
+        int r;
+
+        if (!tpm2_supports_alg(c, TPM2_ALG_ECC)) {
+                ASSERT_ERROR(tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NONE, &template), EOPNOTSUPP);
+                return;
+        }
+
+        /* Without constraints, the most preferred ECC template is selected. */
+        const AkTemplateParams *expected = first_supported_ak_template(c, TPM2_ALG_ECC, TPM2_ALG_NULL, TPM2_ALG_NULL);
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NONE, &template);
+        if (expected) {
+                ASSERT_OK(r);
+                assert_ak_template(&template, expected);
+        } else
+                ASSERT_ERROR(r, EOPNOTSUPP);
+
+        /* Constraints that match a standard template select it. */
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NIST_P256, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA256, TPM2_ECC_NIST_P256 });
+
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NIST_P224, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA256, TPM2_ECC_NIST_P224 });
+
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_SHA256, TPM2_ECC_NONE, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA256, TPM2_ECC_NIST_P256 });
+
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_SHA512, TPM2_ECC_NONE, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA512, TPM2_ECC_NIST_P521 });
+
+        /* Constraints that don't match a standard template are overlaid on to the most preferred one. */
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_SHA512, TPM2_ECC_NIST_P256, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA512, TPM2_ECC_NIST_P256 });
+
+        r = tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_SHA256, TPM2_ECC_NIST_P384, &template);
+        check_selected_ak_template(c, r, &template, &(const AkTemplateParams) { TPM2_ALG_ECC, TPM2_ALG_ECDSA, TPM2_ALG_SHA256, TPM2_ECC_NIST_P384 });
+
+        /* Unknown curves are refused. */
+        ASSERT_ERROR(tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, 0x7fff, &template), EOPNOTSUPP);
+
+        size_t n_saved_curves = c->n_capability_ecc_curves;
+        _cleanup_free_ TPM2_ECC_CURVE *saved_curves =
+                ASSERT_NOT_NULL(newdup(TPM2_ECC_CURVE, c->capability_ecc_curves, n_saved_curves));
+
+        /* Curves that the TPM doesn't support are refused. */
+        hide_ecc_curve(c, TPM2_ECC_NIST_P256);
+        ASSERT_ERROR(tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NIST_P256, &template), EOPNOTSUPP);
+
+        /* Without any curves, nothing can be selected. */
+        set_ecc_curves(c, NULL, 0);
+        ASSERT_ERROR(tpm2_get_best_ecc_attestation_key_templatex(c, TPM2_ALG_NULL, TPM2_ECC_NONE, &template), EOPNOTSUPP);
+
+        set_ecc_curves(c, saved_curves, n_saved_curves);
 }
 
 TEST(tpm2_tpmt_signature_to_pem) {
@@ -2559,6 +2776,9 @@ TEST_RET(tests_which_require_tpm) {
         check_saved_context_marshaling(c);
         check_policy_secret(c);
         check_best_attestation_key_template(c);
+        check_best_attestation_key_templatex(c);
+        check_best_rsa_attestation_key_templatex(c);
+        check_best_ecc_attestation_key_templatex(c);
         check_quote(c);
         check_nv_certify(c);
         check_get_session_audit_digest(c);

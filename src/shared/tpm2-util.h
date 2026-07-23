@@ -373,6 +373,9 @@ int tpm2_calculate_seal(TPM2_HANDLE parent_handle, const TPM2B_PUBLIC *parent_pu
 int tpm2_make_policy_authorize_tbs_data(const TPM2B_DIGEST *approved_digest, const char *policy_ref_data, struct iovec *ret_tbs_data);
 
 int tpm2_get_best_attestation_key_template(Tpm2Context *c, TPMT_PUBLIC *ret);
+int tpm2_get_best_attestation_key_templatex(Tpm2Context *c, TPMI_ALG_ASYM_SCHEME scheme, TPMI_ALG_HASH hash_alg, TPMT_PUBLIC *ret);
+int tpm2_get_best_rsa_attestation_key_templatex(Tpm2Context *c, TPMI_ALG_RSA_SCHEME scheme, TPMI_ALG_HASH hash_alg, uint16_t key_bits, TPMT_PUBLIC *ret);
+int tpm2_get_best_ecc_attestation_key_templatex(Tpm2Context *c, TPMI_ALG_HASH hash_alg, TPMI_ECC_CURVE curve_id, TPMT_PUBLIC *ret);
 
 int tpm2_get_srk_template(TPMI_ALG_PUBLIC alg, TPMT_PUBLIC *ret_template);
 int tpm2_get_best_srk_template(Tpm2Context *c, TPMT_PUBLIC *ret_template);
