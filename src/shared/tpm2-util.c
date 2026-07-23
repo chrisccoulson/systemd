@@ -1998,7 +1998,7 @@ static int tpm2_get_legacy_template(TPMI_ALG_PUBLIC alg, TPMT_PUBLIC *ret_templa
                 },                                                                   \
         }
 
-/* Default attestation key templates. Algorithms are matched on security strength as
+/* Default attestation key templates. Algorithms are generally matched on security strength as
  * per the guidance in NIST SP800-57 part 1. */
 DEFINE_TPM2_AK_TEMPLATE_ECC(SHA512, ECDSA, NIST_P521);
 DEFINE_TPM2_AK_TEMPLATE_ECC(SHA384, ECDSA, NIST_P384);
@@ -2008,6 +2008,8 @@ DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSAPSS, 16384);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSASSA, 16384);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSAPSS, 8192);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSASSA, 8192);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSAPSS, 4096); /* exists to avoid larger key sizes when asking for just sha512. */
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSASSA, 4096); /* exists to avoid larger key sizes when asking for just sha512. */
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSAPSS, 4096);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSASSA, 4096);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSAPSS, 3072);
@@ -2016,6 +2018,19 @@ DEFINE_TPM2_AK_TEMPLATE_RSA(SHA256, RSAPSS, 2048);
 DEFINE_TPM2_AK_TEMPLATE_RSA(SHA256, RSASSA, 2048);
 
 int tpm2_get_best_attestation_key_template(Tpm2Context *c, TPMT_PUBLIC *ret) {
+        return tpm2_get_best_attestation_key_templatex(
+                        c,
+                        /* scheme= */ TPM2_ALG_NULL,
+                        /* hash_alg= */ TPM2_ALG_NULL,
+                        ret);
+}
+
+int tpm2_get_best_attestation_key_templatex(
+                Tpm2Context *c,
+                TPMI_ALG_ASYM_SCHEME scheme,
+                TPMI_ALG_HASH hash_alg,
+                TPMT_PUBLIC *ret) {
+
         assert(c);
         assert(ret);
 
@@ -2032,14 +2047,47 @@ int tpm2_get_best_attestation_key_template(Tpm2Context *c, TPMT_PUBLIC *ret) {
                 /* deprioritize rsa 4k and above because of computational cost. */
                 &ak_template_RSAPSS_4096_SHA384,
                 &ak_template_RSASSA_4096_SHA384,
+                &ak_template_RSAPSS_4096_SHA512,
+                &ak_template_RSASSA_4096_SHA512,
                 &ak_template_RSAPSS_8192_SHA512,
                 &ak_template_RSASSA_8192_SHA512,
                 &ak_template_RSAPSS_16384_SHA512,
                 &ak_template_RSASSA_16384_SHA512,
         };
 
+        if (IN_SET(scheme, TPM2_ALG_RSAPSS, TPM2_ALG_RSASSA))
+                return tpm2_get_best_rsa_attestation_key_templatex(c, scheme, hash_alg, 0, ret);
+        if (scheme == TPM2_ALG_ECDSA)
+                return tpm2_get_best_ecc_attestation_key_templatex(c, hash_alg, TPM2_ECC_NONE, ret);
+        if (scheme != TPM2_ALG_NULL)
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid signing scheme 0x%" PRIx16, scheme);
+
+        /* Try matching the supplied digest algorithm to the standard templates. */
         FOREACH_ELEMENT(t, templates) {
                 TPMT_PUBLIC template = **t;
+
+                if (hash_alg != TPM2_ALG_NULL && hash_alg != template.nameAlg)
+                        continue;
+
+                if (!tpm2_supports_alg(c, template.type))
+                        continue;
+                if (!tpm2_supports_tpmt_public(c, &template))
+                        continue;
+                if (template.type == TPM2_ALG_ECC && !tpm2_supports_ecc_curve(c, template.parameters.eccDetail.curveID))
+                        continue;
+
+                *ret = template;
+                return 0;
+        }
+
+        /* No match, try overlaying the supplied digest algorithm on to the standard templates. */
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
+
+                if (hash_alg != TPM2_ALG_NULL) {
+                        template.nameAlg = hash_alg;
+                        template.parameters.asymDetail.scheme.details.anySig.hashAlg = hash_alg;
+                }
 
                 if (!tpm2_supports_alg(c, template.type))
                         continue;
@@ -2053,6 +2101,148 @@ int tpm2_get_best_attestation_key_template(Tpm2Context *c, TPMT_PUBLIC *ret) {
         }
 
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "No supported attestation key template");
+}
+
+int tpm2_get_best_rsa_attestation_key_templatex(
+                Tpm2Context *c,
+                TPMI_ALG_RSA_SCHEME scheme,
+                TPMI_ALG_HASH hash_alg,
+                uint16_t key_bits,
+                TPMT_PUBLIC *ret) {
+
+        assert(c);
+        assert(ret);
+
+        static const TPMT_PUBLIC *templates[] = {
+                &ak_template_RSAPSS_3072_SHA384,
+                &ak_template_RSASSA_3072_SHA384,
+                &ak_template_RSAPSS_2048_SHA256,
+                &ak_template_RSASSA_2048_SHA256,
+                /* deprioritize rsa 4k and above because of computational cost. */
+                &ak_template_RSAPSS_4096_SHA384,
+                &ak_template_RSASSA_4096_SHA384,
+                &ak_template_RSAPSS_4096_SHA512,
+                &ak_template_RSASSA_4096_SHA512,
+                &ak_template_RSAPSS_8192_SHA512,
+                &ak_template_RSASSA_8192_SHA512,
+                &ak_template_RSAPSS_16384_SHA512,
+                &ak_template_RSASSA_16384_SHA512,
+        };
+
+        if (scheme != TPM2_ALG_NULL && !IN_SET(scheme, TPM2_ALG_RSAPSS, TPM2_ALG_RSASSA))
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid RSA signing scheme 0x%" PRIx16, scheme);
+
+        if (!tpm2_supports_alg(c, TPM2_ALG_RSA))
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "TPM does not support RSA.");
+
+        /* Try matching the supplied constraints to the standard templates. */
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
+
+                if (scheme != TPM2_ALG_NULL && scheme != template.parameters.rsaDetail.scheme.scheme)
+                        continue;
+
+                if (hash_alg != TPM2_ALG_NULL && hash_alg != template.nameAlg)
+                        continue;
+
+                if (key_bits != 0 && key_bits != template.parameters.rsaDetail.keyBits)
+                        continue;
+
+                if (!tpm2_supports_tpmt_public(c, &template))
+                        continue;
+
+                *ret = template;
+                return 0;
+        }
+
+        /* No match, try overlaying the supplied constraints on to the standard templates. */
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
+
+                if (scheme != TPM2_ALG_NULL)
+                        template.parameters.rsaDetail.scheme.scheme = scheme;
+
+                if (hash_alg != TPM2_ALG_NULL) {
+                        template.nameAlg = hash_alg;
+                        template.parameters.rsaDetail.scheme.details.anySig.hashAlg = hash_alg;
+                }
+
+                if (key_bits != 0)
+                        template.parameters.rsaDetail.keyBits = key_bits;
+
+                if (!tpm2_supports_tpmt_public(c, &template))
+                        continue;
+
+                *ret = template;
+                return 0;
+        }
+
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                               "No supported RSA attestation key template with the given constraints.");
+}
+
+int tpm2_get_best_ecc_attestation_key_templatex(
+                Tpm2Context *c,
+                TPMI_ALG_HASH hash_alg,
+                TPMI_ECC_CURVE curve_id,
+                TPMT_PUBLIC *ret) {
+
+        assert(c);
+        assert(ret);
+
+        static const TPMT_PUBLIC *templates[] = {
+                &ak_template_ECDSA_NIST_P384_SHA384,
+                &ak_template_ECDSA_NIST_P256_SHA256,
+                /* deprioritize nistp521 as overkill. */
+                &ak_template_ECDSA_NIST_P521_SHA512,
+                &ak_template_ECDSA_NIST_P224_SHA256,
+        };
+
+        if (!tpm2_supports_alg(c, TPM2_ALG_ECC))
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "TPM does not support ECC.");
+
+        /* Try matching the supplied constraints to the standard templates. */
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
+
+                if (hash_alg != TPM2_ALG_NULL && hash_alg != template.nameAlg)
+                        continue;
+
+                if (curve_id != TPM2_ECC_NONE && curve_id != template.parameters.eccDetail.curveID)
+                        continue;
+
+                if (!tpm2_supports_tpmt_public(c, &template))
+                        continue;
+                if (!tpm2_supports_ecc_curve(c, template.parameters.eccDetail.curveID))
+                        continue;
+
+                *ret = template;
+                return 0;
+        }
+
+        /* No match, try overlaying the supplied constraints on to the standard templates. */
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
+
+                if (hash_alg != TPM2_ALG_NULL) {
+                        template.nameAlg = hash_alg;
+                        template.parameters.eccDetail.scheme.details.ecdsa.hashAlg = hash_alg;
+                }
+
+                if (curve_id != TPM2_ECC_NONE)
+                        template.parameters.eccDetail.curveID = curve_id;
+
+                if (!tpm2_supports_tpmt_public(c, &template))
+                        continue;
+                if (!tpm2_supports_ecc_curve(c, template.parameters.eccDetail.curveID))
+                        continue;
+
+                *ret = template;
+                return 0;
+        }
+
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                               "No supported ECC attestation key template with the given constraints.");
 }
 
 /* Get a Storage Root Key (SRK) template.

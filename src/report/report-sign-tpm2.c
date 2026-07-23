@@ -1054,52 +1054,6 @@ static bool is_persistent_handle(uint64_t h) {
         return h >= UINT64_C(0x81000000) && h <= UINT64_C(0x81ffffff);
 }
 
-/* Build the template for a new signing key. The unique area (used to customize primary keys) is not set here. */
-static void make_signing_key_template(
-                SigningScheme scheme,
-                TPMI_ALG_HASH hash_alg,
-                uint16_t rsa_key_bits,
-                TPMI_ECC_CURVE ecc_curve,
-                TPMT_PUBLIC *ret) {
-
-        assert(ret);
-
-        TPMT_PUBLIC template = {
-                .nameAlg = hash_alg,
-                .objectAttributes =
-                        TPMA_OBJECT_FIXEDTPM |
-                        TPMA_OBJECT_FIXEDPARENT |
-                        TPMA_OBJECT_SENSITIVEDATAORIGIN |
-                        TPMA_OBJECT_USERWITHAUTH |
-                        TPMA_OBJECT_ADMINWITHPOLICY |
-                        TPMA_OBJECT_RESTRICTED |
-                        TPMA_OBJECT_SIGN_ENCRYPT,
-                .parameters.asymDetail.symmetric.algorithm = TPM2_ALG_NULL,
-        };
-
-        switch (scheme) {
-        case SIGNING_SCHEME_RSASSA:
-        case SIGNING_SCHEME_RSAPSS:
-                template.type = TPM2_ALG_RSA;
-                template.parameters.rsaDetail.scheme.scheme = scheme == SIGNING_SCHEME_RSASSA ? TPM2_ALG_RSASSA : TPM2_ALG_RSAPSS;
-                template.parameters.rsaDetail.scheme.details.anySig.hashAlg = hash_alg;
-                template.parameters.rsaDetail.keyBits = rsa_key_bits;
-                template.parameters.rsaDetail.exponent = 0;
-                break;
-        case SIGNING_SCHEME_ECDSA:
-                template.type = TPM2_ALG_ECC;
-                template.parameters.eccDetail.scheme.scheme = TPM2_ALG_ECDSA;
-                template.parameters.eccDetail.scheme.details.ecdsa.hashAlg = hash_alg;
-                template.parameters.eccDetail.curveID = ecc_curve;
-                template.parameters.eccDetail.kdf.scheme = TPM2_ALG_NULL;
-                break;
-        default:
-                assert_not_reached();
-        }
-
-        *ret = template;
-}
-
 /* Copy the supplied nonce into the unique area of the template, used to customize primary keys. */
 static int signing_key_template_set_nonce(TPMT_PUBLIC *template, const struct iovec *nonce) {
         assert(template);
@@ -1248,8 +1202,8 @@ static int vl_method_create_key(
         static const sd_json_dispatch_field dispatch_table[] = {
                 { "name",             SD_JSON_VARIANT_STRING,        sd_json_dispatch_const_string,       offsetof(CreateKeyParameters, name),              SD_JSON_MANDATORY },
                 { "type",             SD_JSON_VARIANT_STRING,        json_dispatch_signing_key_type,      offsetof(CreateKeyParameters, type),              SD_JSON_MANDATORY },
-                { "scheme",           SD_JSON_VARIANT_STRING,        json_dispatch_signing_scheme,        offsetof(CreateKeyParameters, scheme),            SD_JSON_MANDATORY },
-                { "hashAlg",          _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_hash_algorithm,        offsetof(CreateKeyParameters, hash_alg),          SD_JSON_MANDATORY },
+                { "scheme",           SD_JSON_VARIANT_STRING,        json_dispatch_signing_scheme,        offsetof(CreateKeyParameters, scheme),            SD_JSON_NULLABLE  },
+                { "hashAlg",          SD_JSON_VARIANT_STRING,        json_dispatch_hash_algorithm,        offsetof(CreateKeyParameters, hash_alg),          SD_JSON_NULLABLE  },
                 { "rsaKeyBits",       _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,             offsetof(CreateKeyParameters, rsa_key_bits),      SD_JSON_NULLABLE  },
                 { "eccCurve",         SD_JSON_VARIANT_STRING,        json_dispatch_ecc_curve,             offsetof(CreateKeyParameters, ecc_curve),         SD_JSON_NULLABLE  },
                 { "parentHandle",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,             offsetof(CreateKeyParameters, parent_handle),     SD_JSON_NULLABLE  },
@@ -1268,6 +1222,7 @@ static int vl_method_create_key(
         _cleanup_(create_key_parameters_done) CreateKeyParameters p = {
                 .type = _SIGNING_KEY_TYPE_INVALID,
                 .scheme = _SIGNING_SCHEME_INVALID,
+                .hash_alg = _HASH_ALGORITHM_INVALID,
                 .ecc_curve = _ECC_CURVE_INVALID,
                 .hierarchy = _SIGNING_KEY_HIERARCHY_INVALID,
         };
@@ -1288,24 +1243,29 @@ static int vl_method_create_key(
         /* Check the mandatory fields. */
         if (p.type < 0)
                 return sd_varlink_error_invalid_parameter_name(link, "type");
-        if (p.scheme < 0)
-                return sd_varlink_error_invalid_parameter_name(link, "scheme");
 
         if (!filename_is_valid(p.name))
                 return sd_varlink_error_invalid_parameter_name(link, "name");
 
-        bool is_rsa = IN_SET(p.scheme, SIGNING_SCHEME_RSASSA, SIGNING_SCHEME_RSAPSS);
+        /* Validate the template parameters, which are all individually optional. Any that aren't specified
+         * explicitly are filled in automatically by picking the best available values. */
+        TPMI_ALG_PUBLIC family = TPM2_ALG_NULL;
 
-        if (is_rsa) {
-                if (p.rsa_key_bits == 0 || p.rsa_key_bits > UINT16_MAX)
-                        return sd_varlink_error_invalid_parameter_name(link, "rsaKeyBits");
-                if (p.ecc_curve >= 0)
+        if (p.scheme >= 0)
+                family = IN_SET(p.scheme, SIGNING_SCHEME_RSASSA, SIGNING_SCHEME_RSAPSS) ? TPM2_ALG_RSA : TPM2_ALG_ECC;
+
+        if (p.ecc_curve >= 0) {
+                if (family == TPM2_ALG_RSA)
                         return sd_varlink_error_invalid_parameter_name(link, "eccCurve");
-        } else {
-                if (p.ecc_curve < 0)
-                        return sd_varlink_error_invalid_parameter_name(link, "eccCurve");
-                if (p.rsa_key_bits != 0)
+                family = TPM2_ALG_ECC;
+        }
+
+        if (p.rsa_key_bits != 0) {
+                if (family == TPM2_ALG_ECC)
                         return sd_varlink_error_invalid_parameter_name(link, "rsaKeyBits");
+                if (p.rsa_key_bits > UINT16_MAX)
+                        return sd_varlink_error_invalid_parameter_name(link, "rsaKeyBits");
+                family = TPM2_ALG_RSA;
         }
 
         /* Validate the handle/hierarchy combination for the chosen key type. */
@@ -1368,32 +1328,47 @@ static int vl_method_create_key(
         if (iovec_is_set(&p.primary_nonce) && !as_primary)
                 return sd_varlink_error_invalid_parameter_name(link, "primaryNonce");
 
-        /* Build the template for the new restricted signing key. */
-        TPMT_PUBLIC template;
-        make_signing_key_template(
-                        p.scheme,
-                        hash_algorithm_to_tpm(p.hash_alg),
-                        (uint16_t) p.rsa_key_bits,
-                        ecc_curve_to_tpm(p.ecc_curve),
-                        &template);
-
-        /* We've already verified that primaryNonce is only set if we're creating a primary key. */
-        r = signing_key_template_set_nonce(&template, &p.primary_nonce);
-        if (r < 0)
-                return sd_varlink_error_invalid_parameter_name(link, "primaryNonce");
-
         _cleanup_(tpm2_context_unrefp) Tpm2Context *c = NULL;
         r = tpm2_context_new_or_warn(/* device= */ NULL, &c);
         if (r < 0)
                 return r;
 
-        /* Check the TPM actually supports the requested template. */
-        if (!tpm2_supports_alg(c, template.type))
-                return reply_unsupported_template(link, "scheme");
-        if (template.type == TPM2_ALG_ECC && !tpm2_supports_ecc_curve(c, template.parameters.eccDetail.curveID))
-                return reply_unsupported_template(link, "eccCurve");
-        if (!tpm2_test_parms(c, template.type, &template.parameters))
+        /* Build the template for the new restricted signing key. */
+        TPMT_PUBLIC template;
+        TPMI_ALG_HASH hash_alg = p.hash_alg >= 0 ? hash_algorithm_to_tpm(p.hash_alg) : TPM2_ALG_NULL;
+
+        switch (family) {
+        case TPM2_ALG_RSA:
+                r = tpm2_get_best_rsa_attestation_key_templatex(
+                                c,
+                                p.scheme >= 0 ? signing_scheme_to_tpm(p.scheme) : TPM2_ALG_NULL,
+                                hash_alg,
+                                (uint16_t) p.rsa_key_bits,
+                                &template);
+                break;
+        case TPM2_ALG_ECC:
+                r = tpm2_get_best_ecc_attestation_key_templatex(
+                                c,
+                                hash_alg,
+                                p.ecc_curve >= 0 ? ecc_curve_to_tpm(p.ecc_curve) : TPM2_ECC_NONE,
+                                &template);
+                break;
+        default:
+                r = tpm2_get_best_attestation_key_templatex(
+                                c,
+                                TPM2_ALG_NULL,
+                                hash_alg,
+                                &template);
+        }
+        if (r == -EOPNOTSUPP)
                 return reply_unsupported_template(link, /* parameter= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to select signing key template: %m");
+
+        /* We've already verified that primaryNonce is only set if we're creating a primary key. */
+        r = signing_key_template_set_nonce(&template, &p.primary_nonce);
+        if (r < 0)
+                return sd_varlink_error_invalid_parameter_name(link, "primaryNonce");
 
         /* Open (creating if necessary) and exclusively lock the key directory, so that creating the key is
          * safe against signing invocations (which load the keys under the same lock). */
