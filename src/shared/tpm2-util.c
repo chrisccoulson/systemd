@@ -1957,103 +1957,89 @@ static int tpm2_get_legacy_template(TPMI_ALG_PUBLIC alg, TPMT_PUBLIC *ret_templa
         return 0;
 }
 
+#define TPM2_AK_ATTRIBUTES                \
+        TPMA_OBJECT_FIXEDTPM |            \
+        TPMA_OBJECT_FIXEDPARENT |         \
+        TPMA_OBJECT_SENSITIVEDATAORIGIN | \
+        TPMA_OBJECT_USERWITHAUTH |        \
+        TPMA_OBJECT_ADMINWITHPOLICY |     \
+        TPMA_OBJECT_RESTRICTED |          \
+        TPMA_OBJECT_SIGN_ENCRYPT
+
+#define DEFINE_TPM2_AK_TEMPLATE_ECC(hash_alg, _scheme, curve_id)                     \
+        static const TPMT_PUBLIC ak_template_##_scheme##_##curve_id##_##hash_alg = { \
+                .type = TPM2_ALG_ECC,                                                \
+                .nameAlg = TPM2_ALG_##hash_alg,                                      \
+                .objectAttributes = TPM2_AK_ATTRIBUTES,                              \
+                .parameters.eccDetail =  {                                           \
+                        .symmetric.algorithm = TPM2_ALG_NULL,                        \
+                        .scheme = {                                                  \
+                                .scheme = TPM2_ALG_##_scheme,                        \
+                                .details.anySig.hashAlg = TPM2_ALG_##hash_alg,       \
+                        },                                                           \
+                        .curveID = TPM2_ECC_##curve_id,                              \
+                        .kdf.scheme = TPM2_ALG_NULL,                                 \
+                },                                                                   \
+        }
+
+#define DEFINE_TPM2_AK_TEMPLATE_RSA(hash_alg, _scheme, key_bits)                     \
+        static const TPMT_PUBLIC ak_template_##_scheme##_##key_bits##_##hash_alg = { \
+                .type = TPM2_ALG_RSA,                                                \
+                .nameAlg = TPM2_ALG_##hash_alg,                                      \
+                .objectAttributes = TPM2_AK_ATTRIBUTES,                              \
+                .parameters.rsaDetail =  {                                           \
+                        .symmetric.algorithm = TPM2_ALG_NULL,                        \
+                        .scheme = {                                                  \
+                                .scheme = TPM2_ALG_##_scheme,                        \
+                                .details.anySig.hashAlg = TPM2_ALG_##hash_alg,       \
+                        },                                                           \
+                        .keyBits = key_bits,                                         \
+                        .exponent = 0,                                               \
+                },                                                                   \
+        }
+
+/* Default attestation key templates. Algorithms are matched on security strength as
+ * per the guidance in NIST SP800-57 part 1. */
+DEFINE_TPM2_AK_TEMPLATE_ECC(SHA512, ECDSA, NIST_P521);
+DEFINE_TPM2_AK_TEMPLATE_ECC(SHA384, ECDSA, NIST_P384);
+DEFINE_TPM2_AK_TEMPLATE_ECC(SHA256, ECDSA, NIST_P256);
+DEFINE_TPM2_AK_TEMPLATE_ECC(SHA256, ECDSA, NIST_P224);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSAPSS, 16384);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSASSA, 16384);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSAPSS, 8192);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA512, RSASSA, 8192);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSAPSS, 4096);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSASSA, 4096);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSAPSS, 3072);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA384, RSASSA, 3072);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA256, RSAPSS, 2048);
+DEFINE_TPM2_AK_TEMPLATE_RSA(SHA256, RSASSA, 2048);
+
 int tpm2_get_best_attestation_key_template(Tpm2Context *c, TPMT_PUBLIC *ret) {
         assert(c);
         assert(ret);
 
-        static const struct {
-                TPMI_ALG_PUBLIC alg;
-                TPMI_ALG_HASH name_alg;
-                TPMT_ASYM_SCHEME asym_scheme;
-                union {
-                        TPMI_RSA_KEY_BITS rsa_key_bits;
-                        TPMI_ECC_CURVE ecc_curve_id;
-                } asym_params;
-        } template_params[] = {
-                {
-                        .alg = TPM2_ALG_ECC,
-                        .name_alg = TPM2_ALG_SHA384,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_ECDSA,
-                                .details.ecdsa.hashAlg = TPM2_ALG_SHA384,
-                        },
-                        .asym_params.ecc_curve_id = TPM2_ECC_NIST_P384,
-                },
-                {
-                        .alg = TPM2_ALG_ECC,
-                        .name_alg = TPM2_ALG_SHA256,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_ECDSA,
-                                .details.ecdsa.hashAlg = TPM2_ALG_SHA256,
-                        },
-                        .asym_params.ecc_curve_id = TPM2_ECC_NIST_P256,
-                },
-                {
-                        .alg = TPM2_ALG_RSA,
-                        .name_alg = TPM2_ALG_SHA384,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_RSAPSS,
-                                .details.rsapss.hashAlg = TPM2_ALG_SHA384,
-                        },
-                        .asym_params.rsa_key_bits = 3072,
-                },
-                {
-                        .alg = TPM2_ALG_RSA,
-                        .name_alg = TPM2_ALG_SHA384,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_RSASSA,
-                                .details.rsassa.hashAlg = TPM2_ALG_SHA384,
-                        },
-                        .asym_params.rsa_key_bits = 3072,
-                },
-                {
-                        .alg = TPM2_ALG_RSA,
-                        .name_alg = TPM2_ALG_SHA256,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_RSAPSS,
-                                .details.rsapss.hashAlg = TPM2_ALG_SHA256,
-                        },
-                        .asym_params.rsa_key_bits = 2048,
-                },
-                {
-                        .alg = TPM2_ALG_RSA,
-                        .name_alg = TPM2_ALG_SHA256,
-                        .asym_scheme = {
-                                .scheme = TPM2_ALG_RSASSA,
-                                .details.rsassa.hashAlg = TPM2_ALG_SHA256,
-                        },
-                        .asym_params.rsa_key_bits = 2048,
-                },
+        static const TPMT_PUBLIC *templates[] = {
+                &ak_template_ECDSA_NIST_P384_SHA384,
+                &ak_template_ECDSA_NIST_P256_SHA256,
+                /* deprioritize nistp521 as overkill. */
+                &ak_template_ECDSA_NIST_P521_SHA512,
+                &ak_template_ECDSA_NIST_P224_SHA256,
+                &ak_template_RSAPSS_3072_SHA384,
+                &ak_template_RSASSA_3072_SHA384,
+                &ak_template_RSAPSS_2048_SHA256,
+                &ak_template_RSASSA_2048_SHA256,
+                /* deprioritize rsa 4k and above because of computational cost. */
+                &ak_template_RSAPSS_4096_SHA384,
+                &ak_template_RSASSA_4096_SHA384,
+                &ak_template_RSAPSS_8192_SHA512,
+                &ak_template_RSASSA_8192_SHA512,
+                &ak_template_RSAPSS_16384_SHA512,
+                &ak_template_RSASSA_16384_SHA512,
         };
 
-        FOREACH_ELEMENT(p, template_params) {
-                TPMT_PUBLIC template = {
-                        .type = p->alg,
-                        .nameAlg = p->name_alg,
-                        .objectAttributes =
-                                TPMA_OBJECT_FIXEDTPM |
-                                TPMA_OBJECT_FIXEDPARENT |
-                                TPMA_OBJECT_SENSITIVEDATAORIGIN |
-                                TPMA_OBJECT_USERWITHAUTH |
-                                TPMA_OBJECT_ADMINWITHPOLICY |
-                                TPMA_OBJECT_RESTRICTED |
-                                TPMA_OBJECT_SIGN_ENCRYPT,
-                        .parameters.asymDetail = {
-                                .symmetric.algorithm = TPM2_ALG_NULL,
-                                .scheme = p->asym_scheme,
-                        },
-                };
-                switch (template.type) {
-                case TPM2_ALG_RSA:
-                        template.parameters.rsaDetail.keyBits = p->asym_params.rsa_key_bits;
-                        break;
-                case TPM2_ALG_ECC:
-                        template.parameters.eccDetail.curveID = p->asym_params.ecc_curve_id;
-                        template.parameters.eccDetail.kdf.scheme = TPM2_ALG_NULL;
-                        break;
-                default:
-                        assert_not_reached();
-                }
+        FOREACH_ELEMENT(t, templates) {
+                TPMT_PUBLIC template = **t;
 
                 if (!tpm2_supports_alg(c, template.type))
                         continue;
