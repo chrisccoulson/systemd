@@ -1873,28 +1873,151 @@ static void check_policy_secret(Tpm2Context *c) {
         ASSERT_TRUE(digest_check(digest2, "62fd94980db2a746545cab626e9df21a1d0f00472f637d4bf567026e40a6ebed"));
 }
 
+#define AK_ATTRIBUTES                     \
+        (TPMA_OBJECT_FIXEDTPM |           \
+         TPMA_OBJECT_FIXEDPARENT |        \
+         TPMA_OBJECT_SENSITIVEDATAORIGIN | \
+         TPMA_OBJECT_USERWITHAUTH |       \
+         TPMA_OBJECT_RESTRICTED |         \
+         TPMA_OBJECT_SIGN_ENCRYPT)
+
+typedef struct AkTemplateParams {
+        TPMI_ALG_PUBLIC type;
+        TPMI_ALG_ASYM_SCHEME scheme;
+        TPMI_ALG_HASH hash_alg;
+        uint16_t param; /* RSA key bits or ECC curve ID */
+} AkTemplateParams;
+
+/* The attestation key templates, in order of preference. */
+static const AkTemplateParams ak_templates[] = {
+        { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA384, TPM2_ECC_NIST_P384 },
+        { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA256, TPM2_ECC_NIST_P256 },
+        { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA512, TPM2_ECC_NIST_P521 },
+        { TPM2_ALG_ECC, TPM2_ALG_ECDSA,  TPM2_ALG_SHA256, TPM2_ECC_NIST_P224 },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA384, 3072               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA384, 3072               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA256, 2048               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA256, 2048               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA384, 4096               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA384, 4096               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA512, 8192               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 8192               },
+        { TPM2_ALG_RSA, TPM2_ALG_RSAPSS, TPM2_ALG_SHA512, 16384              },
+        { TPM2_ALG_RSA, TPM2_ALG_RSASSA, TPM2_ALG_SHA512, 16384              },
+};
+
+static void make_ak_template(const AkTemplateParams *p, TPMT_PUBLIC *ret) {
+        assert(p);
+        assert(ret);
+
+        *ret = (TPMT_PUBLIC) {
+                .type = p->type,
+                .nameAlg = p->hash_alg,
+                .objectAttributes = AK_ATTRIBUTES,
+                .parameters.asymDetail = {
+                        .symmetric.algorithm = TPM2_ALG_NULL,
+                        .scheme = {
+                                .scheme = p->scheme,
+                                .details.anySig.hashAlg = p->hash_alg,
+                        },
+                },
+        };
+
+        if (p->type == TPM2_ALG_RSA)
+                ret->parameters.rsaDetail.keyBits = p->param;
+        else {
+                ret->parameters.eccDetail.curveID = p->param;
+                ret->parameters.eccDetail.kdf.scheme = TPM2_ALG_NULL;
+        }
+}
+
+static bool supports_ak_template(Tpm2Context *c, const AkTemplateParams *p) {
+        assert(c);
+        assert(p);
+
+        TPMT_PUBLIC template;
+        make_ak_template(p, &template);
+
+        if (!tpm2_supports_alg(c, p->type))
+                return false;
+        if (p->type == TPM2_ALG_ECC && !tpm2_supports_ecc_curve(c, p->param))
+                return false;
+
+        return tpm2_test_parms(c, template.type, &template.parameters);
+}
+
+static void assert_ak_template(const TPMT_PUBLIC *template, const AkTemplateParams *p) {
+        assert(template);
+        assert(p);
+
+        ASSERT_EQ(template->type, p->type);
+        ASSERT_EQ(template->nameAlg, p->hash_alg);
+        ASSERT_EQ(template->objectAttributes, (TPMA_OBJECT) AK_ATTRIBUTES);
+        ASSERT_EQ(template->authPolicy.size, 0u);
+        ASSERT_EQ(template->parameters.asymDetail.symmetric.algorithm, TPM2_ALG_NULL);
+        ASSERT_EQ(template->parameters.asymDetail.scheme.scheme, p->scheme);
+        ASSERT_EQ(template->parameters.asymDetail.scheme.details.anySig.hashAlg, p->hash_alg);
+
+        if (p->type == TPM2_ALG_RSA) {
+                ASSERT_EQ(template->parameters.rsaDetail.keyBits, p->param);
+                ASSERT_EQ(template->parameters.rsaDetail.exponent, 0u);
+                ASSERT_EQ(template->unique.rsa.size, 0u);
+        } else {
+                ASSERT_EQ(template->parameters.eccDetail.curveID, p->param);
+                ASSERT_EQ(template->parameters.eccDetail.kdf.scheme, TPM2_ALG_NULL);
+                ASSERT_EQ(template->unique.ecc.x.size, 0u);
+                ASSERT_EQ(template->unique.ecc.y.size, 0u);
+        }
+}
+
+/* Remove an ECC curve from the context's cached capabilities, so that it appears to be unsupported. */
+static void hide_ecc_curve(Tpm2Context *c, TPM2_ECC_CURVE curve) {
+        assert(c);
+
+        size_t n = 0;
+        FOREACH_ARRAY(i, c->capability_ecc_curves, c->n_capability_ecc_curves)
+                if (*i != curve)
+                        c->capability_ecc_curves[n++] = *i;
+        c->n_capability_ecc_curves = n;
+}
+
+static const AkTemplateParams *first_supported_ak_template(Tpm2Context *c) {
+        assert(c);
+
+        FOREACH_ELEMENT(p, ak_templates)
+                if (supports_ak_template(c, p))
+                        return p;
+
+        return NULL;
+}
+
 static void check_best_attestation_key_template(Tpm2Context *c) {
         assert(c);
 
         TEST_LOG_FUNC();
 
-        TPMT_PUBLIC template;
-        ASSERT_OK(tpm2_get_best_attestation_key_template(c, &template));
+        /* Save the cached curves, as we modify them below. */
+        size_t n_saved_curves = c->n_capability_ecc_curves;
+        _cleanup_free_ TPM2_ECC_CURVE *saved_curves =
+                ASSERT_NOT_NULL(newdup(TPM2_ECC_CURVE, c->capability_ecc_curves, n_saved_curves));
 
-        ASSERT_TRUE(IN_SET(template.type, TPM2_ALG_RSA, TPM2_ALG_ECC));
-        ASSERT_TRUE(IN_SET(template.nameAlg, TPM2_ALG_SHA256, TPM2_ALG_SHA384));
-        ASSERT_EQ(template.objectAttributes, TPMA_OBJECT_FIXEDTPM | TPMA_OBJECT_FIXEDPARENT | TPMA_OBJECT_SENSITIVEDATAORIGIN | TPMA_OBJECT_USERWITHAUTH | TPMA_OBJECT_RESTRICTED | TPMA_OBJECT_SIGN_ENCRYPT);
-        ASSERT_EQ(template.parameters.asymDetail.symmetric.algorithm, TPM2_ALG_NULL);
-        ASSERT_NE(template.parameters.asymDetail.scheme.scheme, TPM2_ALG_NULL);
-        ASSERT_TRUE(IN_SET(template.parameters.asymDetail.scheme.details.anySig.hashAlg, TPM2_ALG_SHA256, TPM2_ALG_SHA384));
+        /* Walk down the list of preferred templates by hiding the curve of each selected ECC template in
+         * turn, until an RSA template is selected. */
+        for (;;) {
+                const AkTemplateParams *expected = ASSERT_NOT_NULL(first_supported_ak_template(c));
 
-        if (template.type == TPM2_ALG_RSA) {
-                ASSERT_TRUE(IN_SET(template.parameters.rsaDetail.scheme.scheme, TPM2_ALG_RSASSA, TPM2_ALG_RSAPSS));
-                ASSERT_TRUE(IN_SET(template.parameters.rsaDetail.keyBits, 2048, 3072));
-        } else {
-                ASSERT_EQ(template.parameters.eccDetail.scheme.scheme, TPM2_ALG_ECDSA);
-                ASSERT_TRUE(IN_SET(template.parameters.eccDetail.curveID, TPM2_ECC_NIST_P256, TPM2_ECC_NIST_P384));
+                TPMT_PUBLIC template;
+                ASSERT_OK(tpm2_get_best_attestation_key_template(c, &template));
+                assert_ak_template(&template, expected);
+
+                if (expected->type != TPM2_ALG_ECC)
+                        break;
+
+                hide_ecc_curve(c, expected->param);
         }
+
+        memcpy(c->capability_ecc_curves, saved_curves, n_saved_curves * sizeof(TPM2_ECC_CURVE));
+        c->n_capability_ecc_curves = n_saved_curves;
 }
 
 TEST(tpm2_tpmt_signature_to_pem) {
